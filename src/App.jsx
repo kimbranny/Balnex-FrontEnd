@@ -632,7 +632,7 @@ export default function App() {
                   </div>
 
                   <button className="primary" type="button" onClick={continueFromDetails}>
-                    Continue to Authorities <span>→</span>
+                    Continue <span>→</span>
                   </button>
                 </div>
               )}

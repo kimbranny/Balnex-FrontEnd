@@ -69,7 +69,11 @@ export default function WalletMenu() {
         aria-expanded={menuOpen}
         aria-haspopup="menu"
       >
-        <span className="wallet-dot on" aria-hidden="true" />
+        {wallet?.adapter.icon ? (
+          <img className="wallet-icon" src={wallet.adapter.icon} alt={wallet.adapter.name} />
+        ) : (
+          <span className="wallet-dot on" aria-hidden="true" />
+        )}
         {shorten(address)}
       </button>
 
