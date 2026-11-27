@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { fetchMarket } from "../lib/market";
+import { createPoller } from "../lib/marketPoller";
+import { TRENDING } from "../lib/trendingConfig";
 import { shorten } from "../lib/utils";
 
-// Public DexScreener API (no key needed). Shows Solana MAINNET market data,
-// independent of the network BALNEX creates tokens on.
-const BOOSTS_URL = "https://api.dexscreener.com/token-boosts/top/v1";
-const TOKENS_URL = "https://api.dexscreener.com/tokens/v1/solana/";
+// Last good dataset survives leaving and returning to this page (shown at once, then refreshed).
+let marketCache = null;
 
 const ALLOWED_IMAGES = ["image/png", "image/jpeg", "image/webp"];
 const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
@@ -34,11 +35,16 @@ function cleanText(value, max) {
     .slice(0, max);
 }
 
-async function fetchJson(url, signal) {
-  const response = await fetch(url, { signal });
-  if (!response.ok) throw new Error(`Market data request failed (${response.status}).`);
-  return response.json();
+function formatAge(createdAt, now) {
+  const created = Number(createdAt);
+  if (!Number.isFinite(created) || created <= 0) return "—";
+  const minutes = Math.max(0, Math.floor((now - created) / 60000));
+  if (minutes < 60) return `${minutes}m`;
+  if (minutes < 1440) return `${Math.floor(minutes / 60)}h`;
+  return `${Math.floor(minutes / 1440)}d`;
 }
+
+const formatCount = (v) => (Number.isFinite(Number(v)) ? Number(v).toLocaleString() : "—");
 
 // Tries to copy the token logo into the browser as a data URL so it can be
 // reused in the creation form. Returns null when the image host blocks
@@ -65,65 +71,52 @@ async function imageToDataUrl(url) {
 }
 
 export default function Trending({ onCreateSimilar }) {
-  const [coins, setCoins] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
+  const [view, setView] = useState({
+    data: marketCache?.data ?? null,
+    lastOk: marketCache?.lastOk ?? 0,
+    error: "",
+    refreshing: true,
+  });
+  const [, setClock] = useState(0);
   const [selected, setSelected] = useState("");
   const [busyAddress, setBusyAddress] = useState("");
+  const pollerRef = useRef(null);
 
-  const load = useCallback(async (signal) => {
-    setLoading(true);
-    setError("");
+  // One poller per visit: refreshes now, then every TRENDING.refreshMs while the tab is visible.
+  // Cleanup stops the timer and aborts any request, so nothing runs after leaving the page.
+  useEffect(() => {
+    const poller = createPoller({
+      fetcher: fetchMarket,
+      intervalMs: TRENDING.refreshMs,
+      staleAfterMs: TRENDING.staleAfterMs,
+      backoffMs: TRENDING.rateLimitBackoffMs,
+      isVisible: () => document.visibilityState === "visible",
+      initial: marketCache,
+      onChange: (state) => {
+        if (state.data) marketCache = { data: state.data, lastOk: state.lastOk };
+        setView(state);
+      },
+    });
+    pollerRef.current = poller;
+    const onVisible = () => poller.onVisible();
+    document.addEventListener("visibilitychange", onVisible);
+    poller.start();
 
-    try {
-      const boosts = await fetchJson(BOOSTS_URL, signal);
+    // Lightweight clock so "stale" and the update age are re-evaluated between refreshes.
+    const clock = setInterval(() => setClock((c) => c + 1), 15000);
 
-      // Keep the first (top-ranked) boost entry per Solana token; it also carries the description.
-      const boostByAddress = new Map();
-      for (const item of Array.isArray(boosts) ? boosts : []) {
-        if (item?.chainId === "solana" && item?.tokenAddress && !boostByAddress.has(item.tokenAddress)) {
-          boostByAddress.set(item.tokenAddress, item);
-        }
-      }
-      const addresses = [...boostByAddress.keys()].slice(0, 30);
-
-      if (addresses.length === 0) {
-        setCoins([]);
-        return;
-      }
-
-      const pairs = await fetchJson(`${TOKENS_URL}${addresses.join(",")}`, signal);
-
-      // Keep the most liquid pair for each token, in the original trending order.
-      const best = new Map();
-      for (const pair of Array.isArray(pairs) ? pairs : []) {
-        const address = pair?.baseToken?.address;
-        if (!address) continue;
-        const current = best.get(address);
-        if (!current || Number(pair?.liquidity?.usd || 0) > Number(current?.liquidity?.usd || 0)) {
-          best.set(address, pair);
-        }
-      }
-
-      setCoins(
-        addresses
-          .map((address) => ({ pair: best.get(address), boost: boostByAddress.get(address) }))
-          .filter((entry) => entry.pair)
-      );
-    } catch (err) {
-      if (err?.name === "AbortError") return;
-      console.error("Trending load error:", err);
-      setError(err?.message || "Couldn't load trending coins.");
-    } finally {
-      if (!signal?.aborted) setLoading(false);
-    }
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      clearInterval(clock);
+      poller.stop();
+      pollerRef.current = null;
+    };
   }, []);
 
-  useEffect(() => {
-    const controller = new AbortController();
-    load(controller.signal);
-    return () => controller.abort();
-  }, [load]);
+  const now = Date.now();
+  const coins = view.data?.coins ?? [];
+  const stale = view.data !== null && (Boolean(view.error) || now - view.lastOk > TRENDING.staleAfterMs);
+  const refresh = () => pollerRef.current?.refresh({ manual: true });
 
   async function handleCreateSimilar({ pair, boost }) {
     const address = pair.baseToken.address;
@@ -155,35 +148,54 @@ export default function Trending({ onCreateSimilar }) {
           <h2>Trending Coins</h2>
           <p className="muted">Pick a trending token as inspiration, then launch your own version.</p>
         </div>
-        <button className="secondary-button compact" type="button" onClick={() => load()} disabled={loading}>
-          {loading ? "Loading…" : "Refresh"}
+        <button className="secondary-button compact" type="button" onClick={refresh} disabled={view.refreshing}>
+          {view.refreshing ? "Refreshing…" : "Refresh"}
         </button>
+      </div>
+
+      <div className="trending-status" aria-live="polite">
+        {view.lastOk ? (
+          <span className={stale ? "badge badge-warn" : "badge badge-ok"}>
+            {stale ? "STALE" : "LIVE"} · updated {new Date(view.lastOk).toLocaleTimeString()}
+          </span>
+        ) : (
+          <span className="badge">Not loaded yet</span>
+        )}
+        {view.refreshing && <span className="spinner" aria-label="Refreshing" />}
+        <small className="helper">Auto-refreshes every {Math.round(TRENDING.refreshMs / 1000)}s while this page is open.</small>
       </div>
 
       <div className="notice">
         <span className="notice-icon">ⓘ</span>
         <div>
-          <strong>Mainnet market data</strong>
+          <strong>Ranked by trading activity, on Solana mainnet</strong>
           <p>
-            Trending lists tokens traded on Solana mainnet. Tokens you create on Devnet won't appear here. Boosted
-            rankings are paid promotions, not a recommendation.
+            Rank comes from volume, transactions, liquidity, price movement and pool age. Paid boosts only help find
+            candidates and never affect rank. Tokens you create on Devnet won't appear here. Not financial advice.
           </p>
         </div>
       </div>
 
-      {error && (
-        <div className="notice notice-error">
+      {view.error && (
+        <div className="notice notice-error" role="alert">
           <div>
-            <strong>Couldn't load trending coins</strong>
-            <p>{error}</p>
+            <strong>{view.data ? "Couldn't refresh. Showing older data." : "Couldn't load trending coins"}</strong>
+            <p>
+              {view.error}
+              {view.data && ` The list below is from ${new Date(view.lastOk).toLocaleTimeString()} and is not live.`}
+            </p>
           </div>
-          <button className="text-button" type="button" onClick={() => load()}>
+          <button className="text-button" type="button" onClick={refresh} disabled={view.refreshing}>
             Try again
           </button>
         </div>
       )}
 
-      {loading && coins.length === 0 && (
+      {view.data?.partial && !view.error && (
+        <p className="helper warning-text">Some market data couldn't be loaded this time, so the list may be incomplete.</p>
+      )}
+
+      {view.refreshing && coins.length === 0 && !view.error && (
         <div className="skeleton-list" aria-busy="true">
           <div className="skeleton" />
           <div className="skeleton" />
@@ -191,15 +203,18 @@ export default function Trending({ onCreateSimilar }) {
         </div>
       )}
 
-      {!loading && !error && coins.length === 0 && (
+      {!view.refreshing && !view.error && view.lastOk > 0 && coins.length === 0 && (
         <div className="empty-state">
-          <strong>Nothing trending right now</strong>
-          <p>Try refreshing in a moment.</p>
+          <strong>No tokens qualify right now</strong>
+          <p>
+            {view.data?.stats?.pairsReceived || 0} pairs were checked, but none met the minimum liquidity ($
+            {TRENDING.minLiquidityUsd.toLocaleString()}), 24h volume and activity filters. Try refreshing in a moment.
+          </p>
         </div>
       )}
 
       <div className="trending-list">
-        {coins.map((entry, index) => {
+        {coins.map((entry) => {
           const { pair, boost } = entry;
           const address = pair.baseToken.address;
           const open = selected === address;
@@ -215,7 +230,7 @@ export default function Trending({ onCreateSimilar }) {
                 aria-expanded={open}
                 onClick={() => setSelected(open ? "" : address)}
               >
-                <span className="trending-rank">{index + 1}</span>
+                <span className="trending-rank">{entry.rank}</span>
                 {pair?.info?.imageUrl ? (
                   <img className="trending-icon" src={pair.info.imageUrl} alt="" loading="lazy" />
                 ) : (
@@ -223,7 +238,10 @@ export default function Trending({ onCreateSimilar }) {
                 )}
                 <div className="trending-name">
                   <strong>{pair.baseToken.name || shorten(address)}</strong>
-                  <small>${pair.baseToken.symbol || "?"} · Vol {formatUsd(pair?.volume?.h24)}</small>
+                  <small>
+                    ${pair.baseToken.symbol || "?"} · Vol {formatUsd(pair?.volume?.h24)} ·{" "}
+                    {formatCount(pair?.txns?.h24?.buys)}B/{formatCount(pair?.txns?.h24?.sells)}S
+                  </small>
                 </div>
                 <div className="trending-price">
                   <strong>{formatPrice(pair.priceUsd)}</strong>
@@ -249,6 +267,35 @@ export default function Trending({ onCreateSimilar }) {
                       <strong>{formatUsd(pair?.volume?.h24)}</strong>
                     </div>
                   </div>
+
+                  <dl className="cost-list">
+                    <dt>Transactions 24h (buys / sells)</dt>
+                    <dd>
+                      {formatCount(pair?.txns?.h24?.buys)} / {formatCount(pair?.txns?.h24?.sells)}
+                    </dd>
+                    <dt>Transactions 1h (buys / sells)</dt>
+                    <dd>
+                      {formatCount(pair?.txns?.h1?.buys)} / {formatCount(pair?.txns?.h1?.sells)}
+                    </dd>
+                    <dt>Pool age</dt>
+                    <dd>{formatAge(pair?.pairCreatedAt, now)}</dd>
+                    <dt>DEX</dt>
+                    <dd>{pair?.dexId || "—"}</dd>
+                    <dt>Token address</dt>
+                    <dd title={address}>{shorten(address, 6, 6)}</dd>
+                    <dt>Pool address</dt>
+                    <dd title={pair?.pairAddress}>{shorten(pair?.pairAddress, 6, 6)}</dd>
+                    <dt>Trending score</dt>
+                    <dd>
+                      {entry.score.toFixed(1)} / 100
+                      {boost && " · boosted (no effect on rank)"}
+                    </dd>
+                  </dl>
+                  <small className="helper">
+                    Score parts (0–1): volume {entry.components.volume.toFixed(2)}, transactions{" "}
+                    {entry.components.transactions.toFixed(2)}, liquidity {entry.components.liquidity.toFixed(2)},
+                    momentum {entry.components.momentum.toFixed(2)}, freshness {entry.components.freshness.toFixed(2)}.
+                  </small>
 
                   {description && <p className="trending-description">{description}</p>}
 

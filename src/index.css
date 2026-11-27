@@ -1857,3 +1857,5 @@ textarea:focus {
 /* Read-only analytics */
 .metric-box { border: 1px solid rgba(255,255,255,.12); border-radius: 14px; padding: 14px; display: grid; gap: 10px; background: rgba(255,255,255,.03); }
 .metric-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; opacity: .85; }
+
+.trending-status { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
