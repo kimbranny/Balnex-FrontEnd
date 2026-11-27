@@ -1,6 +1,7 @@
 import { CLUSTER } from "../config";
 import { explorerAddress, explorerTx, fromRawUnits, shorten } from "../lib/utils";
 import { useToast } from "./Toast";
+import { PoolReserves, TokenStats } from "./Analytics";
 
 const fmt = (n, max = 6) => Number(n).toLocaleString(undefined, { maximumFractionDigits: max });
 
@@ -110,14 +111,6 @@ export default function PoolPanel({ record, verified, onRemove, onForget }) {
           <dd>{fromRawUnits(BigInt(record.solDeposited), 9)} SOL</dd>
         </div>
         <div>
-          <dt>Pool reserves now</dt>
-          <dd>
-            {fmt(verified.reserves.token)} {verified.tokenSymbol || "tokens"}
-            <br />
-            {fmt(verified.reserves.sol)} SOL
-          </dd>
-        </div>
-        <div>
           <dt>Your LP position</dt>
           <dd>
             {fromRawUnits(verified.lpRaw, verified.lpDecimals)}
@@ -126,6 +119,9 @@ export default function PoolPanel({ record, verified, onRemove, onForget }) {
           </dd>
         </div>
       </dl>
+
+      <PoolReserves record={record} symbol={verified.tokenSymbol} />
+      <TokenStats mint={record.mint} symbol={verified.tokenSymbol} />
 
       <CopyRow label="Pool address" value={record.poolId} href={explorerAddress(record.poolId)} />
       {record.signature && <CopyRow label="Creation tx" value={record.signature} href={explorerTx(record.signature)} />}

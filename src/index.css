@@ -1853,3 +1853,7 @@ textarea:focus {
 .authority-text small { opacity: .7; }
 .fee-chip { font-size: .8rem; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(232,121,249,.55); color: #E879F9; background: rgba(192,38,211,.12); white-space: nowrap; }
 .fee-chip.off { border-color: rgba(255,255,255,.15); color: inherit; opacity: .6; background: none; }
+
+/* Read-only analytics */
+.metric-box { border: 1px solid rgba(255,255,255,.12); border-radius: 14px; padding: 14px; display: grid; gap: 10px; background: rgba(255,255,255,.03); }
+.metric-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; opacity: .85; }

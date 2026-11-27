@@ -6,6 +6,7 @@ import { getMint } from "@solana/spl-token";
 import Diagnostics from "../components/Diagnostics";
 import { useToast } from "../components/Toast";
 import { CLUSTER, WSOL_MINT } from "../config";
+import { TokenStats } from "../components/Analytics";
 import { useLaunches } from "../lib/launch";
 import { loadPoolRecords } from "../lib/pools";
 import {
@@ -604,6 +605,7 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
                         )}
                       </dl>
                     )}
+                    <TokenStats mint={token.mint} symbol={token.symbol} />
                     {launch.status === "liquidity_created" && (
                       <button type="button" className="secondary-button compact" onClick={() => onNavigate("liquidity")}>
                         Manage pool / Remove Liquidity →
