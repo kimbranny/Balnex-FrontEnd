@@ -5,7 +5,9 @@ import { SystemProgram, TransactionMessage, VersionedTransaction } from "@solana
 import { useToast } from "../components/Toast";
 import { CLUSTER, WSOL_MINT } from "../config";
 import Diagnostics from "../components/Diagnostics";
+import LaunchCard from "../components/LaunchCard";
 import PoolPanel from "../components/PoolPanel";
+import { completeLaunch, useActiveLaunch } from "../lib/launch";
 import RemoveLiquidity from "../components/RemoveLiquidity";
 import { deletePoolRecord, loadPoolRecords, savePoolRecord, verifyPool } from "../lib/pools";
 import { loadRaydium, prepareCreatePool, readMint } from "../lib/raydium";
@@ -63,6 +65,15 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   const [managing, setManaging] = useState("");
   const [showCreate, setShowCreate] = useState(false);
   const verifyRun = useRef(0);
+  const launch = useActiveLaunch(owner);
+
+  // Releases the launch lock ONLY when the chain check passed: pool account exists on
+  // this network, creation tx has no error, and both reserves hold liquidity.
+  useEffect(() => {
+    if (!launch) return;
+    const done = records.find((r) => r.mint === launch.mint && verifiedMap[r.poolId]?.status === "verified");
+    if (done) completeLaunch(launch.wallet, launch.mint, done.poolId);
+  }, [launch, records, verifiedMap]);
 
   const usable = useMemo(
     () => walletTokens.tokens.filter((token) => token.raw > 0n && token.mint !== WSOL_MINT),
@@ -398,6 +409,8 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
         </div>
         <div className="panel-icon">◈</div>
       </div>
+
+      {launch && <LaunchCard launch={launch} />}
 
       {errInfo && (
         <div className="notice notice-error" role="alert">

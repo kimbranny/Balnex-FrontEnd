@@ -1835,3 +1835,12 @@ textarea:focus {
 .danger-button:active:not(:disabled) { transform: scale(.99); }
 .danger-button:disabled { opacity: .5; cursor: not-allowed; box-shadow: none; }
 @keyframes fadeUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+/* Launch lock + abandon dialog */
+.launch-card { border-color: rgba(255,43,214,.45); box-shadow: 0 0 24px rgba(255,43,214,.12); }
+.danger-text { color: #ff6b7d; }
+.modal-backdrop { position: fixed; inset: 0; background: rgba(5,2,10,.78); backdrop-filter: blur(6px); display: grid; place-items: center; padding: 16px; z-index: 100; }
+.modal { width: min(520px, 100%); max-height: 90vh; overflow: auto; border: 1px solid rgba(255,255,255,.14); border-radius: 18px; padding: 22px; display: grid; gap: 14px; background: #120a1e; animation: fadeUp .25s ease both; }
+.modal h3 { margin: 0; }
+.modal-list { margin: 0; padding-left: 18px; display: grid; gap: 8px; font-size: .9rem; opacity: .9; }
+.check-row { display: flex; gap: 10px; align-items: flex-start; font-size: .9rem; cursor: pointer; }

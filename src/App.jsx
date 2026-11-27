@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { useConnectSheet } from "./components/WalletSheet";
 import WalletMenu from "./components/WalletMenu";
@@ -20,6 +20,8 @@ import { CLUSTER } from "./config";
 import { explorerAddress, explorerTx, friendlyError, saveLocalToken, shorten } from "./lib/utils";
 import { useWalletTokens } from "./lib/useWalletTokens";
 import Liquidity from "./pages/Liquidity";
+import LaunchCard from "./components/LaunchCard";
+import { getActiveLaunch, startLaunch, useActiveLaunch } from "./lib/launch";
 import Manage from "./pages/Manage";
 import Trending from "./pages/Trending";
 
@@ -86,6 +88,19 @@ export default function App() {
   const { open: openConnect } = useConnectSheet();
   const notify = useToast();
   const walletTokens = useWalletTokens();
+
+  // One unfinished launch per wallet (per network). See lib/launch.js.
+  const walletAddress = publicKey ? publicKey.toBase58() : "";
+  const launch = useActiveLaunch(walletAddress);
+  const creatingRef = useRef(false);
+  const prevLaunch = useRef(null);
+
+  // When a launch ends (completed or abandoned), drop the old "token created" screen so
+  // Create Token is available again.
+  useEffect(() => {
+    if (prevLaunch.current && !launch) setCreatedToken(null);
+    prevLaunch.current = launch;
+  }, [launch]);
 
   const [page, setPage] = useState("create");
   const [menuOpen, setMenuOpen] = useState(false);
@@ -206,6 +221,17 @@ export default function App() {
       notify("This token has already been created.", "info");
       return;
     }
+
+    // Launch lock, enforced here in application logic (not just by hiding the button).
+    // Read straight from storage so a stale render can't bypass it.
+    const pending = getActiveLaunch(publicKey.toBase58());
+    if (pending) {
+      notify("Finish or abandon your current launch before creating another token.", "error");
+      navigate("create");
+      return;
+    }
+    if (creatingRef.current) return;
+    creatingRef.current = true;
 
     setIsCreating(true);
     setCreateError("");
@@ -350,16 +376,27 @@ export default function App() {
         createdAt: token.createdAt,
       });
 
+      // Confirmed on-chain: lock the wallet to this launch, then go straight to Create Pool.
+      startLaunch({
+        wallet: publicKey.toBase58(),
+        mint: token.mint,
+        name: token.name,
+        symbol: token.symbol,
+        signature,
+        decimals: tokenDecimals,
+      });
+
       setCreatedToken(token);
-      notify("Token created successfully.", "success");
+      notify("Token created. Now create its liquidity pool.", "success");
       walletTokens.refresh();
-      window.scrollTo({ top: 0, behavior: "smooth" });
+      openLiquidity(token.mint);
     } catch (error) {
       console.error("Token creation error:", error);
       const message = friendlyError(error);
       setCreateError(message);
       notify(message, "error");
     } finally {
+      creatingRef.current = false;
       setIsCreating(false);
     }
   }
@@ -486,7 +523,13 @@ export default function App() {
 
       <main className="main">
         {/* CREATE TOKEN */}
-        {page === "create" && !createdToken && (
+        {page === "create" && launch && (
+          <section className="panel">
+            <LaunchCard launch={launch} onContinue={() => openLiquidity(launch.mint)} />
+          </section>
+        )}
+
+        {page === "create" && !launch && !createdToken && (
           <>
             <section className="intro">
               <div className="status">
@@ -797,7 +840,7 @@ export default function App() {
         )}
 
         {/* CREATION SUCCESS */}
-        {page === "create" && createdToken && (
+        {page === "create" && !launch && createdToken && (
           <section className="panel">
             <div className="success-banner">
               <span>✓</span>
@@ -874,7 +917,7 @@ export default function App() {
         )}
 
         {page === "liquidity" && (
-          <Liquidity walletTokens={walletTokens} initialMint={liquidityMint} onNavigate={navigate} />
+          <Liquidity walletTokens={walletTokens} initialMint={launch?.mint || liquidityMint} onNavigate={navigate} />
         )}
 
         {page === "trending" && <Trending onCreateSimilar={createSimilar} />}
