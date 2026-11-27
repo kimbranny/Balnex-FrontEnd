@@ -1,4 +1,3 @@
-
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { Buffer } from 'buffer'
@@ -9,12 +8,11 @@ import {
 } from '@solana/wallet-adapter-react'
 
 import { WalletModalProvider } from '@solana/wallet-adapter-react-ui'
-import { clusterApiUrl } from '@solana/web3.js'
 
 import '@solana/wallet-adapter-react-ui/styles.css'
 import './index.css'
-
-const endpoint = clusterApiUrl('devnet')
+import { ENDPOINT } from './config'
+import { ToastProvider } from './components/Toast'
 
 // Set Buffer before loading App.jsx and its Solana SPL Token imports.
 globalThis.Buffer = Buffer
@@ -24,10 +22,12 @@ async function startApp() {
 
   createRoot(document.getElementById('root')).render(
     <StrictMode>
-      <ConnectionProvider endpoint={endpoint}>
+      <ConnectionProvider endpoint={ENDPOINT}>
         <WalletProvider wallets={[]} autoConnect>
           <WalletModalProvider>
-            <App />
+            <ToastProvider>
+              <App />
+            </ToastProvider>
           </WalletModalProvider>
         </WalletProvider>
       </ConnectionProvider>
