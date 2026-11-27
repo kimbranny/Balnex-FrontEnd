@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
-import { useWalletModal } from "@solana/wallet-adapter-react-ui";
+import { useConnectSheet } from "./components/WalletSheet";
+import WalletMenu from "./components/WalletMenu";
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   AuthorityType,
@@ -81,8 +82,8 @@ const GUIDE = [
 
 export default function App() {
   const { connection } = useConnection();
-  const { publicKey, connected, disconnect, signTransaction } = useWallet();
-  const { setVisible } = useWalletModal();
+  const { publicKey, connected, signTransaction } = useWallet();
+  const { open: openConnect } = useConnectSheet();
   const notify = useToast();
   const walletTokens = useWalletTokens();
 
@@ -101,14 +102,15 @@ export default function App() {
   const [freezeAuthority, setFreezeAuthority] = useState("revoke");
   const [image, setImage] = useState(null);
 
+  // Set when the form was pre-filled from a trending token ("Create Similar Token").
+  const [inspiration, setInspiration] = useState(null);
+
   // Creation result
   const [isCreating, setIsCreating] = useState(false);
   const [createError, setCreateError] = useState("");
   const [createdToken, setCreatedToken] = useState(null);
 
   const [faqOpen, setFaqOpen] = useState(null);
-
-  const walletAddress = publicKey ? shorten(publicKey.toBase58()) : "";
 
   // Close the menu with Escape and stop the page scrolling behind it.
   useEffect(() => {
@@ -126,15 +128,6 @@ export default function App() {
     setPage(destination);
     setMenuOpen(false);
     window.scrollTo({ top: 0, behavior: "smooth" });
-  }
-
-  function handleWalletClick() {
-    if (connected) {
-      disconnect();
-      notify("Wallet disconnected.", "info");
-    } else {
-      setVisible(true);
-    }
   }
 
   function handleImage(event) {
@@ -159,6 +152,13 @@ export default function App() {
   function validateDetails() {
     if (!name.trim() || !symbol.trim() || !supply || Number(supply) <= 0) {
       return "Enter a token name, symbol and a supply greater than zero.";
+    }
+    if (
+      inspiration &&
+      name.trim().toLowerCase() === inspiration.name.toLowerCase() &&
+      symbol.trim().toLowerCase() === inspiration.symbol.toLowerCase()
+    ) {
+      return `Change the name or symbol. Your token can't use exactly the same name and symbol as ${inspiration.name}, or it could be mistaken for it.`;
     }
     if (!/^\d+$/.test(supply) || !Number.isSafeInteger(Number(supply))) {
       return "Please enter a whole-number token supply within the supported limit.";
@@ -193,7 +193,7 @@ export default function App() {
 
     if (!connected || !publicKey) {
       notify("Please connect your Phantom wallet first.", "error");
-      setVisible(true);
+      openConnect();
       return;
     }
 
@@ -373,10 +373,44 @@ export default function App() {
     setMintAuthority("revoke");
     setFreezeAuthority("revoke");
     setImage(null);
+    setInspiration(null);
     setCreatedToken(null);
     setCreateError("");
     setCreateStep(1);
     navigate("create");
+  }
+
+  // Trending -> Create Similar Token: pre-fills the real creation form. The original
+  // token's mint address is never copied; the user launches a new, independent token.
+  function createSimilar(payload) {
+    setName(payload.name);
+    setSymbol(payload.symbol);
+    setDescription(payload.description);
+    setImage(payload.image);
+    setInspiration({
+      name: payload.name,
+      symbol: payload.symbol,
+      url: payload.source.url,
+      imageRequested: payload.imageRequested,
+    });
+    setCreatedToken(null);
+    setCreateError("");
+    setCreateStep(1);
+    navigate("create");
+
+    if (payload.imageRequested && !payload.image) {
+      notify("Details copied. The logo couldn't be copied automatically, so upload your own.", "info");
+    } else {
+      notify("Details copied. Edit anything before you launch.", "success");
+    }
+  }
+
+  function startBlank() {
+    setName("");
+    setSymbol("");
+    setDescription("");
+    setImage(null);
+    setInspiration(null);
   }
 
   function openLiquidity(mint) {
@@ -402,9 +436,9 @@ export default function App() {
             <span className={menuOpen ? "burger open" : "burger"} aria-hidden="true" />
           </button>
 
-          <button className="brand" onClick={() => navigate("create")} type="button">
-            <span className="brand-icon">B</span>
-            BALNEX<span className="brand-dot">.</span>
+          <button className="brand" onClick={() => navigate("create")} type="button" aria-label="BALNEX home">
+            <span className="brand-b" aria-hidden="true">B</span>
+            <span aria-hidden="true">ALNEX</span>
           </button>
         </div>
 
@@ -423,15 +457,7 @@ export default function App() {
 
         <div className="nav-right">
           <span className="network-badge">{CLUSTER}</span>
-          <button
-            className="wallet"
-            onClick={handleWalletClick}
-            type="button"
-            title={connected ? "Click to disconnect wallet" : "Connect your Solana wallet"}
-          >
-            <span className={connected ? "wallet-dot on" : "wallet-dot"} aria-hidden="true" />
-            {connected ? walletAddress : "Connect Wallet"}
-          </button>
+          <WalletMenu />
         </div>
       </header>
 
@@ -499,6 +525,32 @@ export default function App() {
                     <span>01</span> Token details
                   </div>
                   <p className="step-description">Give your token an identity and set its supply.</p>
+
+                  {inspiration && (
+                    <div className="notice inspiration">
+                      <span className="notice-icon">✦</span>
+                      <div>
+                        <strong>
+                          Inspired by {inspiration.name} (${inspiration.symbol})
+                        </strong>
+                        <p>
+                          This creates a brand-new token with its own mint address. It isn't {inspiration.name} and
+                          won't share its price, holders or liquidity. Everything below is editable
+                          {inspiration.imageRequested && !image ? " — the logo couldn't be copied, so upload your own" : ""}.
+                        </p>
+                        <div className="inspiration-actions">
+                          {inspiration.url && (
+                            <a href={inspiration.url} target="_blank" rel="noopener noreferrer">
+                              View original ↗
+                            </a>
+                          )}
+                          <button type="button" className="text-button" onClick={startBlank}>
+                            Start blank
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
 
                   <div className="field">
                     <label htmlFor="token-name">Token name *</label>
@@ -670,6 +722,12 @@ export default function App() {
                         <small>{description || "No description added"}</small>
                       </div>
                     </div>
+                    {inspiration && (
+                      <div className="review-row">
+                        <span>Inspired by</span>
+                        <strong>New token, not {inspiration.name}</strong>
+                      </div>
+                    )}
                     <div className="review-row">
                       <span>Total supply</span>
                       <strong>{Number(supply || 0).toLocaleString()}</strong>
@@ -819,7 +877,7 @@ export default function App() {
           <Liquidity walletTokens={walletTokens} initialMint={liquidityMint} onNavigate={navigate} />
         )}
 
-        {page === "trending" && <Trending />}
+        {page === "trending" && <Trending onCreateSimilar={createSimilar} />}
 
         {page === "help" && (
           <section className="panel">
@@ -868,8 +926,9 @@ export default function App() {
       </main>
 
       <footer className="footer">
-        <div className="footer-brand">
-          BALNEX<span>.</span>
+        <div className="footer-brand" aria-label="BALNEX">
+          <span className="brand-b" aria-hidden="true">B</span>
+          <span aria-hidden="true">ALNEX</span>
         </div>
         <p>Built for the Solana ecosystem.</p>
         <div className="footer-links">

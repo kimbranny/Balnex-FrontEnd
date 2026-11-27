@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
-import { useWalletModal } from "@solana/wallet-adapter-react-ui";
+import { useConnectSheet } from "../components/WalletSheet";
 import { PublicKey, Transaction } from "@solana/web3.js";
 import { AuthorityType, createSetAuthorityInstruction, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { useToast } from "../components/Toast";
@@ -14,7 +14,7 @@ const AUTHORITY_LABEL = {
 export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) {
   const { connection } = useConnection();
   const { publicKey, connected, signTransaction } = useWallet();
-  const { setVisible } = useWalletModal();
+  const { open: openConnect } = useConnectSheet();
   const notify = useToast();
   const { tokens, loading, error, refresh } = walletTokens;
 
@@ -83,7 +83,7 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
         <span className="eyebrow">TOKEN MANAGEMENT</span>
         <h2>My Tokens</h2>
         <p className="muted">Connect your wallet to see the tokens it holds and manage their authorities.</p>
-        <button className="primary" type="button" onClick={() => setVisible(true)}>
+        <button className="primary" type="button" onClick={() => openConnect()}>
           Connect Wallet <span>→</span>
         </button>
       </section>

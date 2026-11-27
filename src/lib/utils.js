@@ -37,6 +37,26 @@ export function friendlyError(error) {
   return raw || "An unexpected error occurred.";
 }
 
+// Wallet connection errors (wallet-adapter error names) in plain language.
+export function friendlyWalletError(error) {
+  const name = error?.name || "";
+  const raw = String(error?.message || "");
+
+  if (name === "WalletNotReadyError") {
+    return "Phantom isn't ready. Install and unlock Phantom, or open this site inside the Phantom app browser, then try again.";
+  }
+  if (/reject|declin|cancel|denied/i.test(raw)) {
+    return "Connection cancelled. Approve the request in your wallet to connect.";
+  }
+  if (name === "WalletTimeoutError") {
+    return "Your wallet didn't respond in time. Unlock it and try again.";
+  }
+  if (name === "WalletConnectionError" || name === "WalletWindowClosedError") {
+    return raw || "Couldn't connect to your wallet. Unlock it and try again.";
+  }
+  return friendlyError(error);
+}
+
 // Converts a decimal string ("1.25") into raw integer units as a BigInt without float errors.
 export function toRawUnits(amount, decimals) {
   const text = String(amount ?? "").trim();

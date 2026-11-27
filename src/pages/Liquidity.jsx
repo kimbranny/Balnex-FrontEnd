@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
-import { useWalletModal } from "@solana/wallet-adapter-react-ui";
+import { useConnectSheet } from "../components/WalletSheet";
 import { PublicKey } from "@solana/web3.js";
 import { useToast } from "../components/Toast";
 import { CLUSTER, LAST_POOL_KEY, WSOL_MINT } from "../config";
@@ -45,7 +45,7 @@ function tokenLabel(token) {
 export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   const { connection } = useConnection();
   const { publicKey, connected, signAllTransactions } = useWallet();
-  const { setVisible } = useWalletModal();
+  const { open: openConnect } = useConnectSheet();
   const notify = useToast();
 
   const [tab, setTab] = useState("create");
@@ -107,7 +107,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
     setError("");
 
     if (!connected || !publicKey) {
-      setVisible(true);
+      openConnect();
       return;
     }
     if (!selected) {
@@ -174,7 +174,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
       return;
     }
     if (!connected || !publicKey) {
-      setVisible(true);
+      openConnect();
       return;
     }
 
@@ -289,7 +289,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
         <span className="eyebrow">RAYDIUM</span>
         <h2>Liquidity</h2>
         <p className="muted">Connect your wallet to create a pool or manage liquidity.</p>
-        <button className="primary" type="button" onClick={() => setVisible(true)}>
+        <button className="primary" type="button" onClick={() => openConnect()}>
           Connect Wallet <span>→</span>
         </button>
       </section>
