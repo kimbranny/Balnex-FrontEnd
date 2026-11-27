@@ -15,6 +15,7 @@ import {
   verifyFeePaid,
 } from "../lib/fees";
 import { clearPending, evaluatePending, getPending, savePending } from "../lib/feeGuards";
+import { readMetadata } from "../lib/metadata";
 import { readMint } from "../lib/raydium";
 import { StageError, signSendConfirm, simulateWithCost, toFailure } from "../lib/txRunner";
 import { explorerAddress, explorerTx, fromRawUnits, shorten } from "../lib/utils";
@@ -48,6 +49,31 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
     setFailures({});
     setResults({});
   }, [walletKey]);
+
+  // Metaplex metadata (update authority) for each token, read from the chain.
+  const [metaMap, setMetaMap] = useState({});
+  const [metaVersion, setMetaVersion] = useState(0);
+  const [confirmMint, setConfirmMint] = useState("");
+  const mintsKey = tokens.map((t) => t.mint).join(",");
+  useEffect(() => {
+    let cancelled = false;
+    setMetaMap({});
+    (async () => {
+      for (const token of tokens) {
+        let meta;
+        try {
+          meta = await readMetadata(connection, token.mint);
+        } catch (err) {
+          meta = { status: "error", reason: err?.message || "Couldn't read metadata." };
+        }
+        if (cancelled) return;
+        setMetaMap((prev) => ({ ...prev, [token.mint]: meta }));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [connection, mintsKey, metaVersion]);
 
   const selectedKinds = (mint) => Object.keys(selection[mint] || {}).filter((k) => selection[mint][k]);
 
@@ -95,7 +121,11 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
     const live = await getMint(connection, mintKey, "confirmed", programId);
     const wallet = publicKey.toBase58();
 
+    const liveMeta = selectedKinds(token.mint).includes("update") ? await readMetadata(connection, token.mint) : null;
     const eligible = selectedKinds(token.mint).filter((kind) => {
+      if (kind === "update") {
+        return liveMeta?.status === "ok" && liveMeta.isMutable && liveMeta.updateAuthority === wallet;
+      }
       const holder = live[AUTHORITIES[kind].field];
       return holder && holder.toBase58() === wallet;
     });
@@ -203,7 +233,11 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
       const mintKey = new PublicKey(token.mint);
       const info = await readMint(connection, token.mint);
       const after = await getMint(connection, mintKey, "confirmed", new PublicKey(info.programId));
-      const stillActive = plan.kinds.filter((kind) => after[AUTHORITIES[kind].field] !== null);
+      const stillActive = plan.kinds.filter((kind) => kind !== "update" && after[AUTHORITIES[kind].field] !== null);
+      if (plan.kinds.includes("update")) {
+        const metaAfter = await readMetadata(connection, token.mint);
+        if (metaAfter.status !== "ok" || metaAfter.isMutable) stillActive.push("update");
+      }
       if (stillActive.length) {
         throw new StageError("verification", `The transaction confirmed, but ${stillActive.join(" and ")} authority still appears active.`, {
           submitted: true,
@@ -217,6 +251,7 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
       setPlans((prev) => ({ ...prev, [token.mint]: undefined }));
       setSelection((prev) => ({ ...prev, [token.mint]: {} }));
       notify("Authorities revoked and fee paid.", "success");
+      setMetaVersion((v) => v + 1);
       await refresh();
     } catch (err) {
       setFailures((prev) => ({ ...prev, [token.mint]: toFailure(err) }));
@@ -308,18 +343,48 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
 
               {["mint", "freeze", "update"].map((kind) => {
                 const def = AUTHORITIES[kind];
-                const holder = def.field ? token[def.field] : null;
-                const mine = holder && holder === wallet;
-                const revoked = def.supported && !holder;
-                const selectable = def.supported && mine && fee.ok;
-                const checked = Boolean(selection[token.mint]?.[kind]);
-                const state = !def.supported
-                  ? "Not supported"
-                  : revoked
+                const meta = metaMap[token.mint];
+                let holder = def.field ? token[def.field] : null;
+                let mine = holder && holder === wallet;
+                let revoked = !holder;
+                let state;
+                let note = "";
+
+                if (kind === "update") {
+                  if (!meta) {
+                    holder = null;
+                    revoked = false;
+                    state = "Checking metadata…";
+                  } else if (meta.status === "ok") {
+                    holder = meta.updateAuthority;
+                    revoked = !meta.isMutable;
+                    mine = meta.isMutable && holder === wallet;
+                    state = revoked
+                      ? `Revoked · metadata locked (last authority ${shorten(holder)})`
+                      : mine
+                        ? `Active · you control it (${shorten(holder)})`
+                        : `Active · held by ${shorten(holder)}`;
+                  } else if (meta.status === "none") {
+                    holder = null;
+                    revoked = false;
+                    state = "No metadata";
+                    note = "This token was created without on-chain metadata, so it has no update authority to revoke.";
+                  } else {
+                    holder = null;
+                    revoked = false;
+                    state = "Not supported";
+                    note = meta.reason || "Couldn't read this token's metadata.";
+                  }
+                } else {
+                  state = revoked
                     ? "Revoked"
                     : mine
                       ? "Active · you control it"
                       : `Active · held by ${shorten(holder)}`;
+                }
+
+                const selectable = def.supported && mine && fee.ok && (kind !== "update" || meta?.status === "ok");
+                const checked = Boolean(selection[token.mint]?.[kind]);
 
                 return (
                   <label
@@ -334,8 +399,8 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
                     />
                     <div className="authority-text">
                       <span>{def.label}</span>
-                      <strong className={holder ? "status-open" : "status-revoked"}>{state}</strong>
-                      <small className="helper">{def.explain}</small>
+                      <strong className={revoked ? "status-revoked" : holder ? "status-open" : ""}>{state}</strong>
+                      <small className="helper">{note || def.explain}</small>
                     </div>
                     <span className={selectable ? "fee-chip" : "fee-chip off"}>
                       {selectable ? `+${sol(FEE_PER_AUTHORITY_LAMPORTS)} SOL` : "No fee"}
@@ -389,7 +454,7 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
                               <button type="button" className="secondary-button" disabled={busy} onClick={() => setPlans((p) => ({ ...p, [token.mint]: undefined }))}>
                                 Edit
                               </button>
-                              <button type="button" className="danger-button" disabled={busy} onClick={() => handleConfirm(token)}>
+                              <button type="button" className="danger-button" disabled={busy} onClick={() => setConfirmMint(token.mint)}>
                                 {busy ? stage || "Working…" : `Pay ${sol(plan.total)} SOL and revoke`}
                               </button>
                             </div>
@@ -449,6 +514,42 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
           );
         })}
       </div>
+
+      {confirmMint && plans[confirmMint] && (
+        <div className="modal-backdrop" onClick={() => setConfirmMint("")}>
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="revoke-title" onClick={(e) => e.stopPropagation()}>
+            <h3 id="revoke-title">Permanently revoke authority?</h3>
+            <ul className="modal-list">
+              {plans[confirmMint].kinds.map((kind) => (
+                <li key={kind}>
+                  <strong>{AUTHORITIES[kind].label}:</strong> {AUTHORITIES[kind].explain}
+                </li>
+              ))}
+              <li>Revocation is generally irreversible. Nobody, including you, can undo it.</li>
+              <li>
+                You'll pay {sol(plans[confirmMint].total)} SOL to BALNEX. It's one transaction with the revocation: if
+                the revocation fails, you aren't charged.
+              </li>
+            </ul>
+            <div className="button-row">
+              <button type="button" className="secondary-button" onClick={() => setConfirmMint("")}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="danger-button"
+                onClick={() => {
+                  const token = tokens.find((t) => t.mint === confirmMint);
+                  setConfirmMint("");
+                  if (token) handleConfirm(token);
+                }}
+              >
+                Revoke and open Phantom
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 }

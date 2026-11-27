@@ -3,6 +3,7 @@ import { PublicKey, SystemProgram } from "@solana/web3.js";
 import { AuthorityType, createSetAuthorityInstruction } from "@solana/spl-token";
 import { AUTHORITY_FEE_SOL, CLUSTER, MAINNET_FEES_ENABLED, TREASURY_WALLET } from "../config";
 import { findFeeTransfer } from "./feeGuards";
+import { setImmutableInstruction } from "./metadata";
 import { StageError } from "./txRunner";
 import { toRawUnits } from "./utils";
 
@@ -28,8 +29,9 @@ export const AUTHORITIES = {
     label: "Update authority",
     type: null,
     field: null,
-    explain: "Controls token metadata. BALNEX tokens don't use on-chain metadata, so there's nothing to revoke here.",
-    supported: false,
+    explain:
+      "Controls whether token metadata (name, symbol, image/URI) can be modified. Revoking this authority permanently locks metadata changes where supported.",
+    supported: true,
   },
 };
 
@@ -63,7 +65,9 @@ export function feeStatus() {
 // If any instruction fails, the whole transaction fails and the fee is not charged.
 export function buildRevocationInstructions({ owner, mint, programId, kinds, treasury, feeLamports }) {
   const instructions = kinds.map((kind) =>
-    createSetAuthorityInstruction(mint, owner, AUTHORITIES[kind].type, null, [], programId)
+    kind === "update"
+      ? setImmutableInstruction({ mint, owner })
+      : createSetAuthorityInstruction(mint, owner, AUTHORITIES[kind].type, null, [], programId)
   );
   if (feeLamports > 0n) {
     instructions.push(

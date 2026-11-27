@@ -14,7 +14,7 @@ import {
   MINT_SIZE,
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
-import { Keypair, SystemProgram, Transaction } from "@solana/web3.js";
+import { Keypair, SystemProgram, Transaction, VersionedTransaction } from "@solana/web3.js";
 import { useToast } from "./components/Toast";
 import { CLUSTER } from "./config";
 import { explorerAddress, explorerTx, friendlyError, saveLocalToken, shorten } from "./lib/utils";
@@ -22,6 +22,8 @@ import { useWalletTokens } from "./lib/useWalletTokens";
 import Liquidity from "./pages/Liquidity";
 import LaunchCard from "./components/LaunchCard";
 import { getActiveLaunch, startLaunch, useActiveLaunch } from "./lib/launch";
+import { createMetadataInstruction } from "./lib/metadata";
+import { MAX_NAME_BYTES, MAX_SYMBOL_BYTES } from "./lib/metadataCodec";
 import Manage from "./pages/Manage";
 import Trending from "./pages/Trending";
 
@@ -64,7 +66,7 @@ const FAQS = [
   {
     question: "Why doesn't my token name show in Phantom or explorers?",
     answer:
-      "Your name, symbol and logo are shown inside BALNEX only. On-chain token metadata (so wallets and explorers display them) isn't added yet.",
+      "New tokens get on-chain metadata with your name and symbol, so wallets and explorers can display them. Your logo and description are shown inside BALNEX only, because BALNEX has no image hosting yet. Tokens created before this update have no metadata.",
   },
   {
     question: "What is Raydium liquidity?",
@@ -115,6 +117,8 @@ export default function App() {
   const [decimals, setDecimals] = useState("9");
   const [mintAuthority, setMintAuthority] = useState("revoke");
   const [freezeAuthority, setFreezeAuthority] = useState("revoke");
+  // Update authority controls on-chain metadata. Defaults to RETAIN (never revoked silently).
+  const [updateAuthority, setUpdateAuthority] = useState("retain");
   const [image, setImage] = useState(null);
 
   // Set when the form was pre-filled from a trending token ("Create Similar Token").
@@ -174,6 +178,12 @@ export default function App() {
       symbol.trim().toLowerCase() === inspiration.symbol.toLowerCase()
     ) {
       return `Change the name or symbol. Your token can't use exactly the same name and symbol as ${inspiration.name}, or it could be mistaken for it.`;
+    }
+    if (new TextEncoder().encode(name.trim()).length > MAX_NAME_BYTES) {
+      return `Token name can be at most ${MAX_NAME_BYTES} bytes (about ${MAX_NAME_BYTES} letters) so it fits on-chain metadata.`;
+    }
+    if (new TextEncoder().encode(symbol).length > MAX_SYMBOL_BYTES) {
+      return `Token symbol can be at most ${MAX_SYMBOL_BYTES} characters.`;
     }
     if (!/^\d+$/.test(supply) || !Number.isSafeInteger(Number(supply))) {
       return "Please enter a whole-number token supply within the supported limit.";
@@ -311,6 +321,26 @@ export default function App() {
         )
       );
 
+      // 4b. Attach on-chain Metaplex metadata (name + symbol) and apply the Update Authority
+      // choice. Placed BEFORE the mint-authority revoke because creating metadata needs the
+      // mint authority to sign. If the network can't simulate it, we drop just this
+      // instruction below so token creation itself never breaks.
+      let metadataInstruction = null;
+      try {
+        metadataInstruction = createMetadataInstruction({
+          mint: mintKeypair.publicKey,
+          owner: publicKey,
+          name: name.trim(),
+          symbol,
+          uri: "",
+          isMutable: updateAuthority !== "revoke",
+        });
+        transaction.add(metadataInstruction);
+      } catch (metaErr) {
+        console.warn("Metadata instruction not built:", metaErr);
+        metadataInstruction = null;
+      }
+
       // 5. Revoke mint authority if the user selected that option.
       if (mintAuthority === "revoke") {
         transaction.add(
@@ -323,6 +353,26 @@ export default function App() {
             TOKEN_PROGRAM_ID
           )
         );
+      }
+
+      // Check the full transaction on the network before asking Phantom to sign.
+      let metadataAttached = Boolean(metadataInstruction);
+      if (metadataInstruction) {
+        try {
+          const sim = await connection.simulateTransaction(new VersionedTransaction(transaction.compileMessage()), {
+            sigVerify: false,
+            replaceRecentBlockhash: true,
+            commitment: "confirmed",
+          });
+          if (sim.value.err) {
+            console.warn("Simulation with metadata failed; creating without metadata.", sim.value.err, sim.value.logs);
+            transaction.instructions = transaction.instructions.filter((ix) => ix !== metadataInstruction);
+            metadataAttached = false;
+            notify("On-chain metadata couldn't be attached on this network, so the token is created without it.", "info");
+          }
+        } catch (simErr) {
+          console.warn("Simulation unavailable; keeping metadata instruction.", simErr);
+        }
       }
 
       // Sign the new mint account with its generated keypair.
@@ -362,6 +412,8 @@ export default function App() {
         decimals: tokenDecimals,
         mintRevoked: mintAuthority === "revoke",
         freezeRevoked: freezeAuthority === "revoke",
+        metadataAttached,
+        updateRevoked: metadataAttached && updateAuthority === "revoke",
         image,
         createdAt: Date.now(),
       };
@@ -409,6 +461,7 @@ export default function App() {
     setDecimals("9");
     setMintAuthority("revoke");
     setFreezeAuthority("revoke");
+    setUpdateAuthority("retain");
     setImage(null);
     setInspiration(null);
     setCreatedToken(null);
@@ -729,6 +782,29 @@ export default function App() {
                     </label>
                   </div>
 
+                  <div className="authority-setting">
+                    <div className="authority-copy">
+                      <label htmlFor="update-authority">Revoke update authority</label>
+                      <p className="helper">
+                        {updateAuthority === "revoke"
+                          ? "Name and symbol are locked permanently. You can never edit this token's metadata."
+                          : "You keep the ability to change this token's metadata (name, symbol, URI)."}{" "}
+                        Controls whether token metadata can be modified. Revoking this authority permanently locks
+                        metadata changes where supported.
+                      </p>
+                    </div>
+                    <label className="switch" htmlFor="update-authority">
+                      <input
+                        id="update-authority"
+                        type="checkbox"
+                        role="switch"
+                        checked={updateAuthority === "revoke"}
+                        onChange={(e) => setUpdateAuthority(e.target.checked ? "revoke" : "retain")}
+                      />
+                      <span className="switch-slider" />
+                    </label>
+                  </div>
+
                   <div className="notice">
                     <span className="notice-icon">ⓘ</span>
                     <div>
@@ -788,6 +864,10 @@ export default function App() {
                       <strong>{freezeAuthority === "revoke" ? "Revoke" : "Retain"}</strong>
                     </div>
                     <div className="review-row">
+                      <span>Update authority</span>
+                      <strong>{updateAuthority === "revoke" ? "Revoke" : "Retain"}</strong>
+                    </div>
+                    <div className="review-row">
                       <span>Network</span>
                       <strong>Solana {CLUSTER}</strong>
                     </div>
@@ -799,7 +879,7 @@ export default function App() {
                       <strong>One wallet approval</strong>
                       <p>
                         Phantom will ask you to approve one transaction that creates the token, creates your token
-                        account and mints the full supply to you. Your wallet pays the network fee and account rent.
+                        account and mints the full supply to you. Your wallet pays the network fee and account rent, including about 0.006 SOL for the on-chain metadata account.
                       </p>
                     </div>
                   </div>
