@@ -3,7 +3,25 @@
 // Splits "build -> simulate -> sign -> submit -> confirm -> verify" into separate
 // steps so a failure always says WHICH step failed, and whether anything was sent.
 // It never touches private keys; the wallet signs inside the wallet app.
-import { PublicKey } from "@solana/web3.js";
+import { PublicKey, SystemProgram, VersionedTransaction } from "@solana/web3.js";
+
+const KNOWN_PROGRAMS = {
+  [SystemProgram.programId.toBase58()]: "System",
+  TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA: "SPL Token",
+  TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPSuEb: "Token-2022",
+  ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL: "Associated Token",
+  ComputeBudget111111111111111111111111111111: "Compute Budget",
+  MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr: "Memo",
+};
+
+const MAX_TX_BYTES = 1232;
+
+const isVersioned = (tx) => !!tx && typeof tx.version !== "undefined" && !!tx.message;
+export const messageOf = (tx) => (isVersioned(tx) ? tx.message : tx.compileMessage());
+
+// Legacy transactions need wrapping because simulateTransaction's options form
+// only exists for VersionedTransaction.
+export const toSimulatable = (tx) => (isVersioned(tx) ? tx : new VersionedTransaction(tx.compileMessage()));
 
 export const STAGES = {
   prepare: "Preparing",
@@ -49,6 +67,8 @@ export function describeError(error) {
     name: error?.name,
     message: error?.message,
     submitted: details.submitted ?? null,
+    inspection: details.inspection ?? null,
+    signingAttempts: details.attempts ?? null,
     walletErrorCode: inner?.code ?? null,
     walletErrorMessage: inner?.message ?? null,
     signature: details.signature ?? null,
@@ -83,7 +103,7 @@ export function userMessage(error) {
   if (stage === "signing") {
     return {
       title: "Wallet signing failed",
-      outcome: "Nothing was submitted. No SOL or tokens moved.",
+      outcome: "Nothing was submitted. No SOL or tokens moved. (The transaction passed simulation on the network before your wallet opened.)",
       body: error.message,
     };
   }
@@ -122,9 +142,111 @@ export function userMessage(error) {
   };
 }
 
+// Looks inside the transaction BEFORE the wallet sees it. Contains only public data
+// (addresses, sizes, instruction programs); never keys.
+export async function inspectTransaction(connection, tx, owner, expectedProgramId) {
+  const message = messageOf(tx);
+  const version = isVersioned(tx) ? tx.version : "legacy";
+  const lookups = message.addressTableLookups || [];
+
+  let altAccounts = [];
+  if (lookups.length) {
+    const results = await Promise.all(lookups.map((l) => connection.getAddressLookupTable(l.accountKey).catch(() => null)));
+    altAccounts = results.map((r) => r?.value).filter(Boolean);
+  }
+  const keys = message.getAccountKeys({ addressLookupTableAccounts: altAccounts });
+
+  const instructions = message.compiledInstructions.map((ix, index) => {
+    const programId = keys.get(ix.programIdIndex).toBase58();
+    return {
+      index,
+      programId,
+      program: KNOWN_PROGRAMS[programId] || "other",
+      accounts: ix.accountKeyIndexes.length,
+      dataBytes: ix.data.length,
+    };
+  });
+
+  const required = message.header.numRequiredSignatures;
+  const signerKeys = [];
+  for (let i = 0; i < required; i += 1) signerKeys.push(keys.get(i).toBase58());
+  const present = [];
+  if (isVersioned(tx)) {
+    tx.signatures.forEach((sig, i) => {
+      if (sig.some((b) => b !== 0)) present.push(signerKeys[i]);
+    });
+  } else {
+    tx.signatures.forEach((entry) => {
+      if (entry.signature) present.push(entry.publicKey.toBase58());
+    });
+  }
+
+  let sizeBytes = null;
+  let sizeError = null;
+  try {
+    sizeBytes = isVersioned(tx) ? tx.serialize().length : tx.serialize({ requireAllSignatures: false, verifySignatures: false }).length;
+  } catch (err) {
+    sizeError = err?.message || String(err);
+  }
+
+  const blockhash = message.recentBlockhash;
+  const blockhashValid = await connection
+    .isBlockhashValid(blockhash, { commitment: "confirmed" })
+    .then((r) => r.value)
+    .catch(() => null);
+
+  const programIds = [...new Set(instructions.map((i) => i.programId))];
+  const programInfos = await connection.getMultipleAccountsInfo(programIds.map((p) => new PublicKey(p)), "confirmed").catch(() => []);
+  const programs = programIds.map((id, i) => ({
+    programId: id,
+    name: KNOWN_PROGRAMS[id] || "other",
+    exists: programInfos[i] ? true : programInfos.length ? false : null,
+    executable: programInfos[i]?.executable ?? null,
+  }));
+
+  const ownerKey = owner.toBase58();
+  const balance = await connection.getBalance(owner, "confirmed").catch(() => null);
+
+  const inspection = {
+    version,
+    feePayer: keys.get(0).toBase58(),
+    feePayerIsWallet: keys.get(0).toBase58() === ownerKey,
+    recentBlockhash: blockhash,
+    blockhashValid,
+    usesAddressLookupTables: lookups.length > 0,
+    lookupTables: lookups.map((l) => l.accountKey.toBase58()),
+    instructionCount: instructions.length,
+    instructions,
+    requiredSigners: signerKeys,
+    alreadySignedBy: present,
+    walletStillNeedsToSign: signerKeys.includes(ownerKey) && !present.includes(ownerKey),
+    otherSignersMissing: signerKeys.filter((k) => k !== ownerKey && !present.includes(k)),
+    sizeBytes,
+    sizeLimitBytes: MAX_TX_BYTES,
+    sizeError,
+    programs,
+    expectedProgramInvoked: expectedProgramId ? programIds.includes(expectedProgramId) : null,
+    walletBalanceLamports: balance,
+  };
+
+  const problems = [];
+  if (!inspection.feePayerIsWallet) problems.push("The fee payer isn't your connected wallet.");
+  if (!inspection.walletStillNeedsToSign) problems.push("Your wallet isn't a required signer of this transaction.");
+  if (inspection.otherSignersMissing.length) problems.push("A required non-wallet signature is missing.");
+  if (sizeError || (sizeBytes && sizeBytes > MAX_TX_BYTES)) problems.push(`The transaction is too large to send (${sizeBytes ?? sizeError}).`);
+  if (blockhashValid === false) problems.push("The transaction's blockhash has already expired.");
+  if (programs.some((p) => p.exists === false)) problems.push("An instruction targets a program that doesn't exist on this network.");
+  if (expectedProgramId && !inspection.expectedProgramInvoked) problems.push("The transaction doesn't call the expected Raydium CPMM program.");
+  inspection.problems = problems;
+
+  console.log("[BALNEX] pre-sign transaction inspection", inspection);
+  return inspection;
+}
+
 // Simulates the exact transaction (no signature needed) and measures how much SOL it
 // would take from the wallet. Fails early, before the wallet opens, with program logs.
-export async function simulateWithCost(connection, transaction, owner) {
+export async function simulateWithCost(connection, rawTransaction, owner) {
+  const transaction = toSimulatable(rawTransaction);
   const before = await connection.getBalance(owner, "confirmed");
 
   let response;
@@ -216,52 +338,111 @@ async function fetchFailureDetails(connection, signature) {
 
 // Sign with the wallet, submit with preflight, then wait for a real confirmation.
 // Throws StageError for every failure; resolves only when the transaction confirmed.
-export async function signSendConfirm({ connection, transaction, signTransaction, onStage }) {
-  if (typeof signTransaction !== "function") {
+export async function signSendConfirm({ connection, transaction, signTransaction, sendTransaction, onStage, context = {} }) {
+  try {
+    return await signSendConfirmInner({ connection, transaction, signTransaction, sendTransaction, onStage });
+  } catch (err) {
+    if (err instanceof StageError) err.details = { ...context, ...err.details };
+    throw err;
+  }
+}
+
+const isPhantomInternal = (err) => {
+  const code = err?.error?.code ?? err?.code;
+  const raw = err?.error?.message || err?.message || "";
+  return code === -32603 || /^unexpected error$/i.test(raw.trim());
+};
+const isUserReject = (err) => {
+  const code = err?.error?.code ?? err?.code;
+  return code === 4001 || /reject|declin|cancel/i.test(err?.error?.message || err?.message || "");
+};
+const attemptRecord = (method, err) => ({
+  method,
+  code: err?.error?.code ?? err?.code ?? null,
+  name: err?.name ?? null,
+  message: err?.error?.message || err?.message || null,
+});
+
+async function signSendConfirmInner({ connection, transaction, signTransaction, sendTransaction, onStage }) {
+  if (typeof signTransaction !== "function" && typeof sendTransaction !== "function") {
     throw new StageError("signing", "Your wallet can't sign transactions. Reconnect Phantom and try again.", {
       submitted: false,
     });
   }
 
-  const blockhash = transaction?.message?.recentBlockhash || transaction?.recentBlockhash || null;
+  const blockhash = messageOf(transaction).recentBlockhash;
+  const attempts = [];
+  let signature = null;
 
+  // Attempt 1: sign only, then BALNEX submits.
   onStage?.("signing");
-  let signed;
-  try {
-    signed = await signTransaction(transaction);
-  } catch (err) {
-    console.error("Wallet signing error:", err);
-    const code = err?.error?.code ?? err?.code;
-    const raw = err?.error?.message || err?.message || "";
-    let message = raw || "The wallet didn't sign the transaction.";
-    if (code === 4001 || /reject|declin|cancel/i.test(raw)) {
-      message = "You cancelled the request in your wallet.";
-    } else if (code === -32603 || /^unexpected error$/i.test(raw.trim())) {
-      message =
-        "Phantom reported an internal error (-32603 \"Unexpected error\") while signing. Close Phantom, reopen it, make sure this account has enough SOL, then try again.";
+  let signed = null;
+  if (typeof signTransaction === "function") {
+    try {
+      signed = await signTransaction(transaction);
+    } catch (err) {
+      console.error("Wallet signTransaction error:", err);
+      attempts.push(attemptRecord("signTransaction", err));
+      if (isUserReject(err)) {
+        throw new StageError("signing", "You cancelled the request in your wallet.", { submitted: false, attempts, cause: err });
+      }
+      if (!isPhantomInternal(err) || typeof sendTransaction !== "function") {
+        throw new StageError("signing", attempts[0].message || "The wallet didn't sign the transaction.", {
+          submitted: false,
+          attempts,
+          cause: err,
+        });
+      }
     }
-    throw new StageError("signing", message, { submitted: false, cause: err });
   }
 
-  onStage?.("submitting");
-  let signature;
-  try {
-    signature = await connection.sendRawTransaction(signed.serialize(), {
-      skipPreflight: false,
-      preflightCommitment: "confirmed",
-      maxRetries: 5,
-    });
-  } catch (err) {
-    console.error("Submission error:", err);
-    let logs = err?.logs ?? null;
-    if (!logs && typeof err?.getLogs === "function") {
-      logs = await err.getLogs(connection).catch(() => null);
+  // Attempt 2 (only after Phantom's -32603 on attempt 1, so nothing was sent yet):
+  // Phantom's own sign-and-send path, which some Phantom versions handle better.
+  if (!signed) {
+    onStage?.("signing-alt");
+    try {
+      signature = await sendTransaction(transaction, connection, {
+        skipPreflight: false,
+        preflightCommitment: "confirmed",
+        maxRetries: 5,
+      });
+    } catch (err) {
+      console.error("Wallet sendTransaction error:", err);
+      attempts.push(attemptRecord("signAndSendTransaction", err));
+      if (isUserReject(err)) {
+        throw new StageError("signing", "You cancelled the request in your wallet.", { submitted: false, attempts, cause: err });
+      }
+      const inner = err?.error || err;
+      const code = inner?.code ?? null;
+      throw new StageError(
+        "signing",
+        isPhantomInternal(err)
+          ? "Phantom returned its internal error (-32603) on both signing methods. See Technical details."
+          : `The wallet couldn't sign and send: ${inner?.message || err}`,
+        { submitted: false, attempts, phantomInternal: isPhantomInternal(err), cause: err, walletCode: code }
+      );
     }
-    throw new StageError("submission", `${err?.message || "The network rejected the transaction."} ${lastLogLine(logs)}`.trim(), {
-      submitted: false,
-      logs,
-      cause: err,
-    });
+  } else {
+    onStage?.("submitting");
+    try {
+      signature = await connection.sendRawTransaction(signed.serialize(), {
+        skipPreflight: false,
+        preflightCommitment: "confirmed",
+        maxRetries: 5,
+      });
+    } catch (err) {
+      console.error("Submission error:", err);
+      let logs = err?.logs ?? null;
+      if (!logs && typeof err?.getLogs === "function") {
+        logs = await err.getLogs(connection).catch(() => null);
+      }
+      throw new StageError("submission", `${err?.message || "The network rejected the transaction."} ${lastLogLine(logs)}`.trim(), {
+        submitted: false,
+        logs,
+        attempts,
+        cause: err,
+      });
+    }
   }
 
   onStage?.("confirming");
@@ -274,6 +455,7 @@ export async function signSendConfirm({ connection, transaction, signTransaction
       submitted: true,
       signature,
       landed: "unknown",
+      attempts,
       cause: err,
     });
   }
@@ -284,15 +466,7 @@ export async function signSendConfirm({ connection, transaction, signTransaction
     throw new StageError(
       "confirmation",
       `On-chain failure${parsed.programError ? ` (${parsed.programError})` : ""}. ${lastLogLine(extra.logs)}`.trim(),
-      {
-        submitted: true,
-        signature,
-        landed: "failed",
-        status: result.status,
-        logs: extra.logs,
-        rpc: { err: result.status.err },
-        ...parsed,
-      }
+      { submitted: true, signature, landed: "failed", status: result.status, logs: extra.logs, rpc: { err: result.status.err }, attempts, ...parsed }
     );
   }
 
@@ -302,7 +476,7 @@ export async function signSendConfirm({ connection, transaction, signTransaction
       result.state === "expired"
         ? "The transaction expired before the network confirmed it."
         : "The network hasn't confirmed the transaction yet.",
-      { submitted: true, signature, landed: "unknown", status: result.status }
+      { submitted: true, signature, landed: "unknown", status: result.status, attempts }
     );
   }
 

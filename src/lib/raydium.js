@@ -97,7 +97,7 @@ const wsolToken = () =>
   });
 
 // Builds (does not send) the create-pool transaction.
-export async function prepareCreatePool(raydium, { mintInfo, tokenRaw, solRaw }) {
+export async function prepareCreatePool(raydium, { mintInfo, tokenRaw, solRaw, legacy = false }) {
   const sdk = await import("@raydium-io/raydium-sdk-v2");
   const isDevnet = CLUSTER === "devnet";
 
@@ -139,7 +139,7 @@ export async function prepareCreatePool(raydium, { mintInfo, tokenRaw, solRaw })
       feeConfig,
       associatedOnly: false,
       ownerInfo: { useSOLBalance: true },
-      txVersion: sdk.TxVersion.V0,
+      txVersion: legacy ? sdk.TxVersion.LEGACY : sdk.TxVersion.V0,
     });
   } catch (err) {
     throw new StageError("prepare", `Raydium couldn't build the pool transaction: ${err?.message || err}`, {

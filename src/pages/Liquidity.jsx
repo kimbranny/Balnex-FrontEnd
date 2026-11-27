@@ -16,6 +16,7 @@ import {
 import {
   StageError,
   describeError,
+  inspectTransaction,
   signSendConfirm,
   simulateWithCost,
   userMessage,
@@ -53,7 +54,7 @@ function tokenLabel(token) {
 
 export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   const { connection } = useConnection();
-  const { publicKey, connected, signAllTransactions, signTransaction } = useWallet();
+  const { publicKey, connected, signAllTransactions, signTransaction, sendTransaction } = useWallet();
   const { open: openConnect } = useConnectSheet();
   const notify = useToast();
 
@@ -140,7 +141,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   }
 
   // Step 1: read the mint, build the exact transaction, simulate it and show the full cost.
-  async function buildCreatePlan() {
+  async function buildCreatePlan(legacy = false) {
     const mintInfo = await readMint(connection, selected.mint);
     const tokenRaw = toRawUnits(tokenAmount, mintInfo.decimals);
     const solRaw = toRawUnits(solAmount, 9);
@@ -153,13 +154,27 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
     }
 
     const raydium = await getRaydium();
-    const prepared = await prepareCreatePool(raydium, { mintInfo, tokenRaw, solRaw });
+    const prepared = await prepareCreatePool(raydium, { mintInfo, tokenRaw, solRaw, legacy });
     const tx = prepared.built.transaction;
     if (!tx) {
       throw new StageError("prepare", "The Raydium SDK didn't return a transaction to sign.", { submitted: false });
     }
 
-    const sim = await simulateWithCost(connection, tx, publicKey);
+    const inspection = await inspectTransaction(connection, tx, publicKey, prepared.programId);
+    if (inspection.problems.length) {
+      throw new StageError("prepare", `Transaction check failed: ${inspection.problems.join(" ")}`, {
+        submitted: false,
+        inspection,
+      });
+    }
+
+    let sim;
+    try {
+      sim = await simulateWithCost(connection, tx, publicKey);
+    } catch (err) {
+      if (err instanceof StageError) err.details = { ...err.details, inspection };
+      throw err;
+    }
     let networkFee = 5000;
     try {
       const fee = await connection.getFeeForMessage(tx.message, "confirmed");
@@ -177,6 +192,8 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
 
     return {
       builtAt: Date.now(),
+      legacy,
+      inspection,
       prepared,
       mintInfo,
       tokenRaw,
@@ -243,12 +260,49 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
         submitting: "Sending to Solana Devnet…",
         confirming: "Waiting for confirmation…",
       };
-      const { signature } = await signSendConfirm({
-        connection,
-        transaction: active.prepared.built.transaction,
-        signTransaction,
-        onStage: (name) => setStage(labels[name] || ""),
-      });
+      labels["signing-alt"] = "Retrying with Phantom's sign-and-send…";
+      const run = (p) =>
+        signSendConfirm({
+          connection,
+          transaction: p.prepared.built.transaction,
+          signTransaction,
+          sendTransaction,
+          context: { inspection: p.inspection, transactionFormat: p.legacy ? "legacy" : "v0" },
+          onStage: (name) => setStage(labels[name] || ""),
+        });
+
+      let signature;
+      try {
+        ({ signature } = await run(active));
+      } catch (err) {
+        // Nothing was sent when signing fails, so a differently-formatted rebuild is safe.
+        // Only try it if the wallet returned its internal error and the first format was v0.
+        if (!(err instanceof StageError && err.stage === "signing" && err.details?.phantomInternal && !active.legacy)) {
+          throw err;
+        }
+        console.warn("[BALNEX] v0 signing failed with -32603; rebuilding as a legacy transaction", describeError(err));
+        setStage("Rebuilding in legacy format…");
+        let legacyPlan;
+        try {
+          legacyPlan = await buildCreatePlan(true);
+        } catch (legacyErr) {
+          // Report the original signing failure, plus why the fallback wasn't possible.
+          err.details = { ...err.details, legacyFallback: legacyErr?.message || String(legacyErr) };
+          throw err;
+        }
+        if (legacyPlan.cost.total > active.cost.total * 1.02 + 10000) {
+          setPlan(legacyPlan);
+          throw new StageError("prepare", "The legacy-format cost differs from what you approved. Review it and confirm again.", { submitted: false });
+        }
+        active = legacyPlan;
+        setPlan(legacyPlan);
+        try {
+          ({ signature } = await run(legacyPlan));
+        } catch (legacyErr) {
+          if (legacyErr instanceof StageError) legacyErr.details = { ...legacyErr.details, v0Attempts: err.details?.attempts };
+          throw legacyErr;
+        }
+      }
 
       setStage("Verifying the pool on-chain…");
       await verifyPoolAccount(connection, active.prepared.poolId, active.prepared.programId, signature);
@@ -284,6 +338,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
       connection,
       transaction: tx,
       signTransaction,
+      sendTransaction,
       onStage: (name) =>
         setStage({ signing: "Waiting for your wallet…", submitting: "Sending…", confirming: "Confirming…" }[name] || ""),
     });
