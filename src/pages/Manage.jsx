@@ -1,79 +1,191 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { useConnectSheet } from "../components/WalletSheet";
 import { PublicKey, Transaction } from "@solana/web3.js";
-import { AuthorityType, createSetAuthorityInstruction, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { getMint } from "@solana/spl-token";
+import Diagnostics from "../components/Diagnostics";
 import { useToast } from "../components/Toast";
-import { explorerAddress, friendlyError, shorten } from "../lib/utils";
+import { CLUSTER } from "../config";
+import {
+  AUTHORITIES,
+  FEE_PER_AUTHORITY_LAMPORTS,
+  buildRevocationInstructions,
+  calcFee,
+  feeStatus,
+  verifyFeePaid,
+} from "../lib/fees";
+import { readMint } from "../lib/raydium";
+import { StageError, signSendConfirm, simulateWithCost, toFailure } from "../lib/txRunner";
+import { explorerAddress, explorerTx, fromRawUnits, shorten } from "../lib/utils";
 
-const AUTHORITY_LABEL = {
-  [AuthorityType.MintTokens]: "mint",
-  [AuthorityType.FreezeAccount]: "freeze",
-};
+const PLAN_MAX_AGE_MS = 40000;
+const BUFFER_LAMPORTS = 2000000n;
+const sol = (lamports) => fromRawUnits(BigInt(lamports), 9);
 
 export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) {
   const { connection } = useConnection();
-  const { publicKey, connected, signTransaction } = useWallet();
+  const { publicKey, connected, signTransaction, sendTransaction } = useWallet();
   const { open: openConnect } = useConnectSheet();
   const notify = useToast();
   const { tokens, loading, error, refresh } = walletTokens;
 
-  const [busyKey, setBusyKey] = useState("");
-  const [confirming, setConfirming] = useState(null);
+  const fee = feeStatus();
+  const lock = useRef(false); // blocks double-clicks / duplicate submissions
 
-  async function revoke(token, authorityType) {
-    if (!publicKey || !signTransaction) {
-      notify("Reconnect Phantom — your wallet cannot sign transactions.", "error");
-      return;
+  const [selection, setSelection] = useState({}); // { [mint]: { mint: bool, freeze: bool } }
+  const [plans, setPlans] = useState({}); // { [mint]: plan }
+  const [busyMint, setBusyMint] = useState("");
+  const [stage, setStage] = useState("");
+  const [failures, setFailures] = useState({});
+  const [results, setResults] = useState({});
+
+  const selectedKinds = (mint) => Object.keys(selection[mint] || {}).filter((k) => selection[mint][k]);
+
+  function toggle(mint, kind) {
+    if (busyMint) return;
+    setSelection((prev) => ({ ...prev, [mint]: { ...prev[mint], [kind]: !prev[mint]?.[kind] } }));
+    setPlans((prev) => ({ ...prev, [mint]: undefined }));
+    setResults((prev) => ({ ...prev, [mint]: undefined }));
+  }
+
+  // Reads the mint FRESH from the chain, keeps only authorities that are still active and
+  // controlled by this wallet, then builds + simulates the single combined transaction.
+  async function buildPlan(token) {
+    if (!fee.ok) throw new StageError("prepare", fee.reason, { submitted: false });
+
+    const mintKey = new PublicKey(token.mint);
+    const info = await readMint(connection, token.mint);
+    const programId = new PublicKey(info.programId);
+    const live = await getMint(connection, mintKey, "confirmed", programId);
+    const wallet = publicKey.toBase58();
+
+    const eligible = selectedKinds(token.mint).filter((kind) => {
+      const holder = live[AUTHORITIES[kind].field];
+      return holder && holder.toBase58() === wallet;
+    });
+    const dropped = selectedKinds(token.mint).filter((kind) => !eligible.includes(kind));
+    if (dropped.length) {
+      notify("Some selected authorities are already revoked or not yours; they won't be charged.", "info");
     }
 
-    const label = AUTHORITY_LABEL[authorityType];
-    const key = `${token.mint}:${label}`;
-    setBusyKey(key);
+    const { kinds, total } = calcFee(eligible);
+    if (kinds.length === 0) {
+      throw new StageError("prepare", "None of the selected authorities can be revoked, so nothing will be charged.", {
+        submitted: false,
+      });
+    }
+
+    const { blockhash } = await connection.getLatestBlockhash("confirmed");
+    const tx = new Transaction({ feePayer: publicKey, recentBlockhash: blockhash }).add(
+      ...buildRevocationInstructions({
+        owner: publicKey,
+        mint: mintKey,
+        programId,
+        kinds,
+        treasury: fee.treasury,
+        feeLamports: total,
+      })
+    );
+
+    await simulateWithCost(connection, tx, publicKey);
+
+    let networkFee = 5000n;
+    try {
+      const res = await connection.getFeeForMessage(tx.compileMessage(), "confirmed");
+      if (typeof res?.value === "number") networkFee = BigInt(res.value);
+    } catch {
+      // keep estimate
+    }
+    const balance = BigInt(await connection.getBalance(publicKey, "confirmed"));
+
+    return { mint: token.mint, kinds, total, networkFee, balance, tx, builtAt: Date.now(), dropped };
+  }
+
+  async function handleReview(token) {
+    if (lock.current) return;
+    lock.current = true;
+    setFailures((prev) => ({ ...prev, [token.mint]: undefined }));
+    setResults((prev) => ({ ...prev, [token.mint]: undefined }));
+    setBusyMint(token.mint);
+    setStage("Checking the chain and simulating…");
+    try {
+      const plan = await buildPlan(token);
+      setPlans((prev) => ({ ...prev, [token.mint]: plan }));
+    } catch (err) {
+      setFailures((prev) => ({ ...prev, [token.mint]: toFailure(err) }));
+    } finally {
+      lock.current = false;
+      setBusyMint("");
+      setStage("");
+    }
+  }
+
+  async function handleConfirm(token) {
+    const existing = plans[token.mint];
+    if (!existing || lock.current) return;
+    lock.current = true;
+    setFailures((prev) => ({ ...prev, [token.mint]: undefined }));
+    setBusyMint(token.mint);
 
     try {
-      const latest = await connection.getLatestBlockhash("confirmed");
-      const transaction = new Transaction();
-      transaction.feePayer = publicKey;
-      transaction.recentBlockhash = latest.blockhash;
-      transaction.add(
-        createSetAuthorityInstruction(
-          new PublicKey(token.mint),
-          publicKey,
-          authorityType,
-          null,
-          [],
-          TOKEN_PROGRAM_ID
-        )
-      );
-
-      const signed = await signTransaction(transaction);
-      const signature = await connection.sendRawTransaction(signed.serialize(), {
-        skipPreflight: false,
-        preflightCommitment: "confirmed",
-      });
-
-      const confirmation = await connection.confirmTransaction(
-        {
-          signature,
-          blockhash: latest.blockhash,
-          lastValidBlockHeight: latest.lastValidBlockHeight,
-        },
-        "confirmed"
-      );
-
-      if (confirmation.value.err) {
-        throw new Error("The transaction failed on-chain. The authority was not revoked.");
+      let plan = existing;
+      if (Date.now() - plan.builtAt > PLAN_MAX_AGE_MS) {
+        setStage("Refreshing the transaction…");
+        plan = await buildPlan(token);
+        if (plan.total !== existing.total) {
+          setPlans((prev) => ({ ...prev, [token.mint]: plan }));
+          throw new StageError("prepare", "The fee changed because some authorities are no longer eligible. Review the new total.", {
+            submitted: false,
+          });
+        }
+        setPlans((prev) => ({ ...prev, [token.mint]: plan }));
       }
 
-      notify(`${label[0].toUpperCase()}${label.slice(1)} authority revoked.`, "success");
-      setConfirming(null);
+      if (plan.balance < plan.total + plan.networkFee + BUFFER_LAMPORTS) {
+        const short = plan.total + plan.networkFee + BUFFER_LAMPORTS - plan.balance;
+        throw new StageError("prepare", `You need about ${sol(short)} more SOL to pay this fee.`, { submitted: false });
+      }
+
+      const labels = {
+        signing: "Waiting for Phantom approval…",
+        "signing-alt": "Retrying with Phantom's sign-and-send…",
+        submitting: "Sending…",
+        confirming: "Waiting for confirmation…",
+      };
+      const { signature } = await signSendConfirm({
+        connection,
+        transaction: plan.tx,
+        signTransaction,
+        sendTransaction,
+        onStage: (name) => setStage(labels[name] || ""),
+      });
+
+      // Verify BOTH outcomes on-chain before claiming success.
+      setStage("Verifying the revocation and payment…");
+      const mintKey = new PublicKey(token.mint);
+      const info = await readMint(connection, token.mint);
+      const after = await getMint(connection, mintKey, "confirmed", new PublicKey(info.programId));
+      const stillActive = plan.kinds.filter((kind) => after[AUTHORITIES[kind].field] !== null);
+      if (stillActive.length) {
+        throw new StageError("verification", `The transaction confirmed, but ${stillActive.join(" and ")} authority still appears active.`, {
+          submitted: true,
+          signature,
+        });
+      }
+      await verifyFeePaid(connection, signature, fee.treasury, plan.total);
+
+      setResults((prev) => ({ ...prev, [token.mint]: { signature, kinds: plan.kinds, total: plan.total } }));
+      setPlans((prev) => ({ ...prev, [token.mint]: undefined }));
+      setSelection((prev) => ({ ...prev, [token.mint]: {} }));
+      notify("Authorities revoked and fee paid.", "success");
       await refresh();
     } catch (err) {
-      console.error("Revoke authority error:", err);
-      notify(friendlyError(err), "error");
+      setFailures((prev) => ({ ...prev, [token.mint]: toFailure(err) }));
+      notify("Revocation did not complete. See details on the token.", "error");
     } finally {
-      setBusyKey("");
+      lock.current = false;
+      setBusyMint("");
+      setStage("");
     }
   }
 
@@ -96,7 +208,7 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
         <div>
           <span className="eyebrow">TOKEN MANAGEMENT</span>
           <h2>My Tokens</h2>
-          <p className="muted">SPL tokens in your wallet. Revoke authorities you control, or add liquidity.</p>
+          <p className="muted">SPL tokens in your wallet. Revoke authorities you control (0.1 SOL each), or create a pool.</p>
         </div>
         <button className="secondary-button compact" type="button" onClick={refresh} disabled={loading}>
           {loading ? "Loading…" : "Refresh"}
@@ -155,83 +267,143 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
                 </div>
               </div>
 
-              <div className="authority-row">
-                <div>
-                  <span>Mint authority</span>
-                  <strong className={token.mintAuthority ? "status-open" : "status-revoked"}>
-                    {token.mintAuthority ? (canRevokeMint ? "You control it" : shorten(token.mintAuthority)) : "Revoked"}
-                  </strong>
-                </div>
-                {canRevokeMint && (
-                  confirming === `${token.mint}:mint` ? (
-                    <div className="confirm-inline">
-                      <button
-                        type="button"
-                        className="danger-button"
-                        disabled={busyKey === `${token.mint}:mint`}
-                        onClick={() => revoke(token, AuthorityType.MintTokens)}
-                      >
-                        {busyKey === `${token.mint}:mint` ? "Revoking…" : "Confirm revoke"}
-                      </button>
-                      <button type="button" className="text-button" onClick={() => setConfirming(null)}>
-                        Cancel
-                      </button>
-                    </div>
-                  ) : (
-                    <button
-                      type="button"
-                      className="secondary-button compact"
-                      disabled={Boolean(busyKey)}
-                      onClick={() => setConfirming(`${token.mint}:mint`)}
-                    >
-                      Revoke
-                    </button>
-                  )
-                )}
-              </div>
+              {["mint", "freeze", "update"].map((kind) => {
+                const def = AUTHORITIES[kind];
+                const holder = def.field ? token[def.field] : null;
+                const mine = holder && holder === wallet;
+                const revoked = def.supported && !holder;
+                const selectable = def.supported && mine && fee.ok;
+                const checked = Boolean(selection[token.mint]?.[kind]);
+                const state = !def.supported
+                  ? "Not supported"
+                  : revoked
+                    ? "Revoked"
+                    : mine
+                      ? "Active · you control it"
+                      : `Active · held by ${shorten(holder)}`;
 
-              <div className="authority-row">
-                <div>
-                  <span>Freeze authority</span>
-                  <strong className={token.freezeAuthority ? "status-open" : "status-revoked"}>
-                    {token.freezeAuthority ? (canRevokeFreeze ? "You control it" : shorten(token.freezeAuthority)) : "Revoked"}
-                  </strong>
-                </div>
-                {canRevokeFreeze && (
-                  confirming === `${token.mint}:freeze` ? (
-                    <div className="confirm-inline">
-                      <button
-                        type="button"
-                        className="danger-button"
-                        disabled={busyKey === `${token.mint}:freeze`}
-                        onClick={() => revoke(token, AuthorityType.FreezeAccount)}
-                      >
-                        {busyKey === `${token.mint}:freeze` ? "Revoking…" : "Confirm revoke"}
-                      </button>
-                      <button type="button" className="text-button" onClick={() => setConfirming(null)}>
-                        Cancel
-                      </button>
+                return (
+                  <label
+                    className={selectable ? "authority-row authority-pick" : "authority-row authority-pick disabled"}
+                    key={kind}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      disabled={!selectable || Boolean(busyMint)}
+                      onChange={() => toggle(token.mint, kind)}
+                    />
+                    <div className="authority-text">
+                      <span>{def.label}</span>
+                      <strong className={holder ? "status-open" : "status-revoked"}>{state}</strong>
+                      <small className="helper">{def.explain}</small>
                     </div>
-                  ) : (
-                    <button
-                      type="button"
-                      className="secondary-button compact"
-                      disabled={Boolean(busyKey)}
-                      onClick={() => setConfirming(`${token.mint}:freeze`)}
-                    >
-                      Revoke
-                    </button>
-                  )
-                )}
-              </div>
+                    <span className={selectable ? "fee-chip" : "fee-chip off"}>
+                      {selectable ? `+${sol(FEE_PER_AUTHORITY_LAMPORTS)} SOL` : "No fee"}
+                    </span>
+                  </label>
+                );
+              })}
 
-              {(canRevokeMint || canRevokeFreeze) && confirming?.startsWith(token.mint) && (
-                <p className="helper warning-text">Revoking is permanent. It cannot be undone once confirmed on-chain.</p>
-              )}
+              {(() => {
+                const kinds = selectedKinds(token.mint);
+                const { total, count } = calcFee(kinds);
+                const plan = plans[token.mint];
+                const failure = failures[token.mint];
+                const result = results[token.mint];
+                const busy = busyMint === token.mint;
+
+                return (
+                  <>
+                    {!fee.ok && (canRevokeMint || canRevokeFreeze) && (
+                      <p className="helper warning-text">{fee.reason}</p>
+                    )}
+
+                    {count > 0 && (
+                      <div className="cost-box">
+                        <strong>Authority service fee</strong>
+                        <dl className="cost-list">
+                          {kinds.map((kind) => (
+                            <FeeLine key={kind} label={AUTHORITIES[kind].label} value={`${sol(FEE_PER_AUTHORITY_LAMPORTS)} SOL`} />
+                          ))}
+                          <dt className="total">Total service fee</dt>
+                          <dd className="total">{sol(total)} SOL</dd>
+                        </dl>
+                        <p className="helper">
+                          Revoking is permanent. The fee and the revocation are one transaction: if the revocation
+                          fails, the fee isn't charged. Only active authorities you control are charged.
+                        </p>
+
+                        {plan ? (
+                          <>
+                            <dl className="cost-list">
+                              <dt>Service fee to treasury</dt>
+                              <dd>{sol(plan.total)} SOL</dd>
+                              <dt>Network fee (est.)</dt>
+                              <dd>{sol(plan.networkFee)} SOL</dd>
+                              <dt>Treasury wallet</dt>
+                              <dd title={String(fee.treasury)}>{shorten(String(fee.treasury), 6, 6)}</dd>
+                              <dt>Network</dt>
+                              <dd>{CLUSTER}</dd>
+                            </dl>
+                            <div className="button-row">
+                              <button type="button" className="secondary-button" disabled={busy} onClick={() => setPlans((p) => ({ ...p, [token.mint]: undefined }))}>
+                                Edit
+                              </button>
+                              <button type="button" className="danger-button" disabled={busy} onClick={() => handleConfirm(token)}>
+                                {busy ? stage || "Working…" : `Pay ${sol(plan.total)} SOL and revoke`}
+                              </button>
+                            </div>
+                          </>
+                        ) : (
+                          <button type="button" className="primary" disabled={busy || Boolean(busyMint) || !fee.ok} onClick={() => handleReview(token)}>
+                            {busy ? stage || "Checking…" : `Review ${sol(total)} SOL fee`}
+                          </button>
+                        )}
+                      </div>
+                    )}
+
+                    {result && (
+                      <div className="success-banner">
+                        <span>✓</span>
+                        <div>
+                          <strong>
+                            Revoked {result.kinds.join(" + ")} · paid {sol(result.total)} SOL
+                          </strong>
+                          <p>
+                            Verified on-chain.{" "}
+                            <a href={explorerTx(result.signature)} target="_blank" rel="noopener noreferrer">
+                              View transaction ↗
+                            </a>
+                          </p>
+                        </div>
+                      </div>
+                    )}
+
+                    {failure && (
+                      <div className="notice notice-error" role="alert">
+                        <div>
+                          <strong>{failure.info.title}</strong>
+                          <p>{failure.info.outcome}</p>
+                          <p>{failure.info.body}</p>
+                          {failure.diag?.signature && (
+                            <p>
+                              <a href={explorerTx(failure.diag.signature)} target="_blank" rel="noopener noreferrer">
+                                View transaction ↗
+                              </a>
+                            </p>
+                          )}
+                          <Diagnostics data={failure.diag} />
+                        </div>
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
 
               <div className="token-actions">
                 <button type="button" className="secondary-button compact" onClick={() => onUseForLiquidity(token.mint)}>
-                  Add liquidity →
+                  Create pool →
                 </button>
               </div>
             </article>
@@ -239,5 +411,14 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
         })}
       </div>
     </section>
+  );
+}
+
+function FeeLine({ label, value }) {
+  return (
+    <>
+      <dt>{label}</dt>
+      <dd>{value}</dd>
+    </>
   );
 }

@@ -1844,3 +1844,12 @@ textarea:focus {
 .modal h3 { margin: 0; }
 .modal-list { margin: 0; padding-left: 18px; display: grid; gap: 8px; font-size: .9rem; opacity: .9; }
 .check-row { display: flex; gap: 10px; align-items: flex-start; font-size: .9rem; cursor: pointer; }
+
+/* Authority fee selection */
+.authority-pick { display: grid !important; grid-template-columns: auto 1fr auto; gap: 12px; align-items: start; cursor: pointer; }
+.authority-pick.disabled { opacity: .65; cursor: default; }
+.authority-pick input { margin-top: 4px; accent-color: #C026D3; width: 18px; height: 18px; }
+.authority-text { display: grid; gap: 2px; }
+.authority-text small { opacity: .7; }
+.fee-chip { font-size: .8rem; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(232,121,249,.55); color: #E879F9; background: rgba(192,38,211,.12); white-space: nowrap; }
+.fee-chip.off { border-color: rgba(255,255,255,.15); color: inherit; opacity: .6; background: none; }
