@@ -1796,3 +1796,19 @@ textarea:focus {
     scroll-behavior: auto !important;
   }
 }
+
+/* Pool cost breakdown, diagnostics, verified success details */
+.cost-box { border: 1px solid var(--border, rgba(255,255,255,.12)); border-radius: 14px; padding: 16px; display: grid; gap: 12px; background: rgba(255,255,255,.03); }
+.cost-list, .detail-list { display: grid; grid-template-columns: 1fr auto; gap: 8px 16px; margin: 0; font-size: .9rem; }
+.cost-list dt, .detail-list dt { opacity: .75; }
+.cost-list dd, .detail-list dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.cost-list .total { font-weight: 700; opacity: 1; padding-top: 8px; border-top: 1px solid rgba(255,255,255,.12); }
+.detail-list { grid-template-columns: 1fr; gap: 2px; margin: 10px 0; }
+.detail-list dt { font-size: .75rem; text-transform: uppercase; letter-spacing: .06em; margin-top: 8px; }
+.detail-list dd { text-align: left; word-break: break-all; font-size: .85rem; }
+.button-row { display: flex; gap: 10px; flex-wrap: wrap; }
+.button-row .primary { flex: 1; min-width: 180px; }
+.diagnostics { margin-top: 10px; font-size: .85rem; }
+.diagnostics summary { cursor: pointer; opacity: .85; }
+.diag-pre { max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-word; background: rgba(0,0,0,.35); padding: 10px; border-radius: 10px; font-size: .75rem; }
+.text-button { background: none; border: 0; color: inherit; text-decoration: underline; cursor: pointer; padding: 6px 0; font: inherit; opacity: .85; }

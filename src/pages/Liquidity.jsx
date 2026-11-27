@@ -4,21 +4,30 @@ import { useConnectSheet } from "../components/WalletSheet";
 import { PublicKey } from "@solana/web3.js";
 import { useToast } from "../components/Toast";
 import { CLUSTER, LAST_POOL_KEY, WSOL_MINT } from "../config";
+import Diagnostics from "../components/Diagnostics";
 import {
-  addCpmmLiquidity,
-  createCpmmPool,
   fetchPool,
   loadRaydium,
-  removeCpmmLiquidity,
+  prepareAddLiquidity,
+  prepareCreatePool,
+  prepareRemoveLiquidity,
+  readMint,
 } from "../lib/raydium";
 import {
-  explorerAddress,
-  explorerTx,
-  friendlyError,
-  fromRawUnits,
-  shorten,
-  toRawUnits,
-} from "../lib/utils";
+  StageError,
+  describeError,
+  signSendConfirm,
+  simulateWithCost,
+  userMessage,
+  verifyPoolAccount,
+} from "../lib/txRunner";
+import { explorerAddress, explorerTx, fromRawUnits, shorten, toRawUnits } from "../lib/utils";
+
+const PLAN_MAX_AGE_MS = 40000;
+const BUFFER_LAMPORTS = 5000000n; // keep 0.005 SOL spare for fees
+
+const sol = (lamports) =>
+  (Number(lamports) / 1e9).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 6 });
 
 const TABS = [
   { id: "create", label: "Create pool" },
@@ -44,13 +53,17 @@ function tokenLabel(token) {
 
 export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   const { connection } = useConnection();
-  const { publicKey, connected, signAllTransactions } = useWallet();
+  const { publicKey, connected, signAllTransactions, signTransaction } = useWallet();
   const { open: openConnect } = useConnectSheet();
   const notify = useToast();
 
   const [tab, setTab] = useState("create");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [errInfo, setErrInfo] = useState(null);
+  const [diag, setDiag] = useState(null);
+  const [stage, setStage] = useState("");
+  const [plan, setPlan] = useState(null);
 
   // Create pool
   const [selectedMint, setSelectedMint] = useState(initialMint || "");
@@ -103,8 +116,80 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
     return loadRaydium({ connection, publicKey, signAllTransactions });
   }
 
-  async function handleCreatePool() {
+  function clearFailure() {
     setError("");
+    setErrInfo(null);
+    setDiag(null);
+  }
+
+  function fail(err) {
+    console.error("[BALNEX] transaction failure", describeError(err), err);
+    if (err instanceof StageError) {
+      setErrInfo(userMessage(err));
+      setDiag(describeError(err));
+      setError("");
+    } else {
+      const wrapped = new StageError("unknown", err?.message || String(err) || "Unknown error.", {
+        submitted: null,
+        cause: err,
+      });
+      setErrInfo(userMessage(wrapped));
+      setDiag(describeError(wrapped));
+    }
+    notify("Transaction did not complete. See details below.", "error");
+  }
+
+  // Step 1: read the mint, build the exact transaction, simulate it and show the full cost.
+  async function buildCreatePlan() {
+    const mintInfo = await readMint(connection, selected.mint);
+    const tokenRaw = toRawUnits(tokenAmount, mintInfo.decimals);
+    const solRaw = toRawUnits(solAmount, 9);
+
+    if (tokenRaw <= 0n || solRaw <= 0n) {
+      throw new StageError("prepare", "Enter a token amount and a SOL amount greater than zero.", { submitted: false });
+    }
+    if (tokenRaw > selected.raw) {
+      throw new StageError("prepare", "You don't hold that many tokens.", { submitted: false });
+    }
+
+    const raydium = await getRaydium();
+    const prepared = await prepareCreatePool(raydium, { mintInfo, tokenRaw, solRaw });
+    const tx = prepared.built.transaction;
+    if (!tx) {
+      throw new StageError("prepare", "The Raydium SDK didn't return a transaction to sign.", { submitted: false });
+    }
+
+    const sim = await simulateWithCost(connection, tx, publicKey);
+    let networkFee = 5000;
+    try {
+      const fee = await connection.getFeeForMessage(tx.message, "confirmed");
+      if (typeof fee?.value === "number") networkFee = fee.value;
+    } catch {
+      // keep the default estimate
+    }
+
+    const deposit = Number(solRaw);
+    const poolFee = prepared.createPoolFeeLamports;
+    const outflow = sim.outflow ?? deposit + poolFee;
+    const rent = Math.max(0, outflow - deposit - poolFee);
+    const total = deposit + poolFee + rent + networkFee;
+    const balance = await connection.getBalance(publicKey, "confirmed");
+
+    return {
+      builtAt: Date.now(),
+      prepared,
+      mintInfo,
+      tokenRaw,
+      solRaw,
+      cost: { deposit, poolFee, rent, networkFee, total, balance },
+      simLogs: sim.logs,
+    };
+  }
+
+  async function handleReviewPool() {
+    clearFailure();
+    setCreated(null);
+    setPlan(null);
 
     if (!connected || !publicKey) {
       openConnect();
@@ -115,53 +200,94 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
       return;
     }
 
-    let tokenRaw;
-    let solRaw;
-    try {
-      tokenRaw = toRawUnits(tokenAmount, selected.decimals);
-      solRaw = toRawUnits(solAmount, 9);
-    } catch (err) {
-      setError(err.message);
-      return;
-    }
-
-    if (tokenRaw <= 0n || solRaw <= 0n) {
-      setError("Enter a token amount and a SOL amount greater than zero.");
-      return;
-    }
-    if (tokenRaw > selected.raw) {
-      setError("You don't hold that many tokens.");
-      return;
-    }
-
     setBusy(true);
+    setStage("Checking your token and simulating the pool…");
     try {
-      const lamports = BigInt(await connection.getBalance(publicKey));
-      if (lamports < solRaw) {
-        throw new Error("Your wallet doesn't hold enough SOL for this liquidity amount.");
-      }
-
-      const raydium = await getRaydium();
-      const result = await createCpmmPool(raydium, {
-        mint: selected.mint,
-        mintDecimals: selected.decimals,
-        tokenRaw,
-        solRaw,
-      });
-
-      rememberPool(result.poolId);
-      setCreated(result);
-      setPool(null);
-      notify("Raydium pool created.", "success");
-      walletTokens.refresh();
+      const next = await buildCreatePlan();
+      setPlan(next);
     } catch (err) {
-      console.error("Create pool error:", err);
-      const message = friendlyError(err);
-      setError(message);
-      notify(message, "error");
+      fail(err);
     } finally {
       setBusy(false);
+      setStage("");
     }
+  }
+
+  // Step 2: user confirmed the cost. Sign, send, confirm, verify.
+  async function handleConfirmPool() {
+    if (!plan) return;
+    clearFailure();
+    setBusy(true);
+
+    try {
+      let active = plan;
+      if (Date.now() - plan.builtAt > PLAN_MAX_AGE_MS) {
+        setStage("Refreshing the transaction…");
+        active = await buildCreatePlan();
+        if (active.cost.total > plan.cost.total * 1.02 + 10000) {
+          setPlan(active);
+          throw new StageError("prepare", "The cost changed while you were reviewing. Check the updated total and confirm again.", {
+            submitted: false,
+          });
+        }
+        setPlan(active);
+      }
+
+      if (BigInt(active.cost.balance) < BigInt(Math.ceil(active.cost.total)) + BUFFER_LAMPORTS) {
+        const short = BigInt(Math.ceil(active.cost.total)) + BUFFER_LAMPORTS - BigInt(active.cost.balance);
+        throw new StageError("prepare", `You need about ${sol(short)} more SOL to cover this pool.`, { submitted: false });
+      }
+
+      const labels = {
+        signing: "Waiting for your wallet to sign…",
+        submitting: "Sending to Solana Devnet…",
+        confirming: "Waiting for confirmation…",
+      };
+      const { signature } = await signSendConfirm({
+        connection,
+        transaction: active.prepared.built.transaction,
+        signTransaction,
+        onStage: (name) => setStage(labels[name] || ""),
+      });
+
+      setStage("Verifying the pool on-chain…");
+      await verifyPoolAccount(connection, active.prepared.poolId, active.prepared.programId, signature);
+
+      rememberPool(active.prepared.poolId);
+      setCreated({
+        action: "created",
+        txId: signature,
+        poolId: active.prepared.poolId,
+        lpMint: active.prepared.lpMint,
+        mint: selected.mint,
+        solDeposited: active.cost.deposit,
+        tokenDeposited: fromRawUnits(active.tokenRaw, active.mintInfo.decimals),
+      });
+      setPlan(null);
+      setPool(null);
+      notify("Raydium pool created and verified.", "success");
+      walletTokens.refresh();
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(false);
+      setStage("");
+    }
+  }
+
+  // Shared path for add / remove liquidity: simulate, sign, send, confirm.
+  async function runExisting(built) {
+    const tx = built.transaction;
+    if (!tx) throw new StageError("prepare", "The Raydium SDK didn't return a transaction to sign.", { submitted: false });
+    await simulateWithCost(connection, tx, publicKey);
+    const { signature } = await signSendConfirm({
+      connection,
+      transaction: tx,
+      signTransaction,
+      onStage: (name) =>
+        setStage({ signing: "Waiting for your wallet…", submitting: "Sending…", confirming: "Confirming…" }[name] || ""),
+    });
+    return signature;
   }
 
   async function handleLoadPool() {
@@ -201,14 +327,14 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
       rememberPool(poolId.trim());
     } catch (err) {
       console.error("Load pool error:", err);
-      setError(friendlyError(err));
+      setError((err?.message || "Couldn't load that pool."));
     } finally {
       setLoadingPool(false);
     }
   }
 
   async function handleAdd() {
-    setError("");
+    clearFailure();
     if (!pool) return;
 
     const side_ = side === "A" ? pool.poolInfo.mintA : pool.poolInfo.mintB;
@@ -227,30 +353,29 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
     setBusy(true);
     try {
       const raydium = await getRaydium();
-      const { txId } = await addCpmmLiquidity(raydium, {
+      const built = await prepareAddLiquidity(raydium, {
         poolInfo: pool.poolInfo,
         poolKeys: pool.poolKeys,
         amountRaw,
         baseIn: side === "A",
         slippagePercent: slippage,
       });
+      const txId = await runExisting(built);
       setCreated({ txId, poolId: poolId.trim(), action: "added" });
       setAddAmount("");
       notify("Liquidity added.", "success");
       walletTokens.refresh();
       handleLoadPool();
     } catch (err) {
-      console.error("Add liquidity error:", err);
-      const message = friendlyError(err);
-      setError(message);
-      notify(message, "error");
+      fail(err);
     } finally {
       setBusy(false);
+      setStage("");
     }
   }
 
   async function handleRemove() {
-    setError("");
+    clearFailure();
     if (!pool) return;
 
     const amount = (lpRaw * BigInt(removePercent || 0)) / 100n;
@@ -262,24 +387,23 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
     setBusy(true);
     try {
       const raydium = await getRaydium();
-      const { txId } = await removeCpmmLiquidity(raydium, {
+      const built = await prepareRemoveLiquidity(raydium, {
         poolInfo: pool.poolInfo,
         poolKeys: pool.poolKeys,
         lpRaw: amount,
         slippagePercent: slippage,
       });
+      const txId = await runExisting(built);
       setCreated({ txId, poolId: poolId.trim(), action: "removed" });
       setRemovePercent("");
       notify("Liquidity removed.", "success");
       walletTokens.refresh();
       handleLoadPool();
     } catch (err) {
-      console.error("Remove liquidity error:", err);
-      const message = friendlyError(err);
-      setError(message);
-      notify(message, "error");
+      fail(err);
     } finally {
       setBusy(false);
+      setStage("");
     }
   }
 
@@ -329,7 +453,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
       </div>
 
       {created && (
-        <div className="success-banner">
+        <div className="success-banner success-detail">
           <span>✓</span>
           <div>
             <strong>
@@ -337,11 +461,31 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
                 ? "Liquidity added"
                 : created.action === "removed"
                   ? "Liquidity removed"
-                  : "Pool created"}
+                  : "Pool created and verified on Devnet"}
             </strong>
+            {created.action === "created" && (
+              <dl className="detail-list">
+                <dt>Pool ID</dt>
+                <dd>{created.poolId}</dd>
+                <dt>Transaction</dt>
+                <dd>{created.txId}</dd>
+                <dt>Token mint</dt>
+                <dd>{created.mint}</dd>
+                <dt>SOL deposited</dt>
+                <dd>{sol(created.solDeposited)} SOL</dd>
+                <dt>Tokens deposited</dt>
+                <dd>{created.tokenDeposited}</dd>
+                {created.lpMint && (
+                  <>
+                    <dt>LP mint</dt>
+                    <dd>{created.lpMint}</dd>
+                  </>
+                )}
+              </dl>
+            )}
             <p>
               <a href={explorerTx(created.txId)} target="_blank" rel="noopener noreferrer">
-                View transaction ↗
+                View transaction on Solana Explorer ↗
               </a>
               {" · "}
               <a href={explorerAddress(created.poolId)} target="_blank" rel="noopener noreferrer">
@@ -352,10 +496,28 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
         </div>
       )}
 
+      {errInfo && (
+        <div className="notice notice-error" role="alert">
+          <div>
+            <strong>{errInfo.title}</strong>
+            <p>{errInfo.outcome}</p>
+            <p>{errInfo.body}</p>
+            {diag?.signature && (
+              <p>
+                <a href={explorerTx(diag.signature)} target="_blank" rel="noopener noreferrer">
+                  View transaction ↗
+                </a>
+              </p>
+            )}
+            <Diagnostics data={diag} />
+          </div>
+        </div>
+      )}
+
       {error && (
         <div className="notice notice-error" role="alert">
           <div>
-            <strong>Something went wrong</strong>
+            <strong>Check your input</strong>
             <p>{error}</p>
           </div>
         </div>
@@ -407,7 +569,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
                       className={percent === String(value) ? "liquidity-percentage selected" : "liquidity-percentage"}
                       aria-pressed={percent === String(value)}
                       onClick={() => pickPercent(value)}
-                      disabled={busy || !selected}
+                      disabled={busy || !!plan || !selected}
                     >
                       {value}%
                     </button>
@@ -418,7 +580,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
                   inputMode="decimal"
                   placeholder="0.0"
                   value={tokenAmount}
-                  disabled={busy}
+                  disabled={busy || !!plan}
                   onChange={(e) => {
                     setTokenAmount(e.target.value);
                     setPercent("");
@@ -435,7 +597,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
                     inputMode="decimal"
                     placeholder="0.0"
                     value={solAmount}
-                    disabled={busy}
+                    disabled={busy || !!plan}
                     onChange={(e) => setSolAmount(e.target.value)}
                   />
                   <span>SOL</span>
@@ -457,21 +619,61 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
                 </div>
               </div>
 
-              <div className="notice">
-                <span className="notice-icon">ⓘ</span>
-                <div>
-                  <strong>Review in your wallet</strong>
-                  <p>
-                    Your starting amounts set the initial price. Raydium charges a one-time pool creation fee plus
-                    account rent on top of the amounts above — Phantom shows the total before you approve.
+              {plan ? (
+                <div className="cost-box">
+                  <strong>Full cost before you approve</strong>
+                  <dl className="cost-list">
+                    <dt>Liquidity deposit (goes into the pool)</dt>
+                    <dd>{sol(plan.cost.deposit)} SOL</dd>
+                    <dt>Raydium pool creation fee</dt>
+                    <dd>{sol(plan.cost.poolFee)} SOL</dd>
+                    <dt>Account rent (est., refundable only when accounts close)</dt>
+                    <dd>{sol(plan.cost.rent)} SOL</dd>
+                    <dt>Network fee</dt>
+                    <dd>{sol(plan.cost.networkFee)} SOL</dd>
+                    <dt className="total">Total leaving your wallet</dt>
+                    <dd className="total">≈ {sol(plan.cost.total)} SOL</dd>
+                    <dt>Your balance</dt>
+                    <dd>{sol(plan.cost.balance)} SOL</dd>
+                  </dl>
+                  <p className="helper">
+                    Tokens deposited: {fromRawUnits(plan.tokenRaw, plan.mintInfo.decimals)} (token has{" "}
+                    {plan.mintInfo.decimals} decimals). The simulation succeeded, so nothing has been sent yet.
                   </p>
+                  {BigInt(plan.cost.balance) < BigInt(Math.ceil(plan.cost.total)) + BUFFER_LAMPORTS && (
+                    <p className="helper">
+                      You need about{" "}
+                      {sol(BigInt(Math.ceil(plan.cost.total)) + BUFFER_LAMPORTS - BigInt(plan.cost.balance))} more SOL.
+                    </p>
+                  )}
+                  <div className="button-row">
+                    <button className="secondary-button" type="button" disabled={busy} onClick={() => setPlan(null)}>
+                      Edit
+                    </button>
+                    <button className="primary" type="button" disabled={busy} onClick={handleConfirmPool}>
+                      {busy ? stage || "Working…" : "Confirm and open wallet"}
+                    </button>
+                  </div>
                 </div>
-              </div>
+              ) : (
+                <>
+                  <div className="notice">
+                    <span className="notice-icon">ⓘ</span>
+                    <div>
+                      <strong>You'll see the full cost first</strong>
+                      <p>
+                        We simulate the pool, then show your liquidity deposit separately from Raydium's creation fee,
+                        account rent and the network fee before your wallet opens.
+                      </p>
+                    </div>
+                  </div>
 
-              <button className="primary" type="button" disabled={busy} onClick={handleCreatePool}>
-                {busy ? "Creating pool…" : "Create Raydium pool"}
-                {!busy && <span> →</span>}
-              </button>
+                  <button className="primary" type="button" disabled={busy} onClick={handleReviewPool}>
+                    {busy ? stage || "Checking…" : "Review pool cost"}
+                    {!busy && <span> →</span>}
+                  </button>
+                </>
+              )}
             </>
           )}
         </div>
@@ -581,7 +783,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
               </div>
 
               <button className="primary" type="button" disabled={busy || !addAmount} onClick={handleAdd}>
-                {busy ? "Adding liquidity…" : "Add liquidity"}
+                {busy ? stage || "Adding liquidity…" : "Add liquidity"}
                 {!busy && <span> →</span>}
               </button>
             </>
@@ -614,7 +816,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
                 disabled={busy || lpRaw === 0n || !removePercent}
                 onClick={handleRemove}
               >
-                {busy ? "Removing liquidity…" : "Remove liquidity"}
+                {busy ? stage || "Removing liquidity…" : "Remove liquidity"}
                 {!busy && <span> →</span>}
               </button>
             </>
