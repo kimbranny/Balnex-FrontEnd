@@ -117,6 +117,13 @@ export function userMessage(error) {
     };
   }
   if (stage === "confirmation") {
+    if (d.landed === "confirmed") {
+      return {
+        title: "Already completed",
+        outcome: "A previous transaction went through. Nothing more was sent or charged.",
+        body: error.message,
+      };
+    }
     if (d.landed === "failed") {
       return {
         title: "Submitted, but it failed on-chain",
@@ -362,9 +369,9 @@ async function fetchFailureDetails(connection, signature) {
 
 // Sign with the wallet, submit with preflight, then wait for a real confirmation.
 // Throws StageError for every failure; resolves only when the transaction confirmed.
-export async function signSendConfirm({ connection, transaction, signTransaction, sendTransaction, onStage, context = {} }) {
+export async function signSendConfirm({ connection, transaction, signTransaction, sendTransaction, onStage, onSubmitted, context = {} }) {
   try {
-    return await signSendConfirmInner({ connection, transaction, signTransaction, sendTransaction, onStage });
+    return await signSendConfirmInner({ connection, transaction, signTransaction, sendTransaction, onStage, onSubmitted });
   } catch (err) {
     if (err instanceof StageError) err.details = { ...context, ...err.details };
     throw err;
@@ -387,7 +394,7 @@ const attemptRecord = (method, err) => ({
   message: err?.error?.message || err?.message || null,
 });
 
-async function signSendConfirmInner({ connection, transaction, signTransaction, sendTransaction, onStage }) {
+async function signSendConfirmInner({ connection, transaction, signTransaction, sendTransaction, onStage, onSubmitted }) {
   if (typeof signTransaction !== "function" && typeof sendTransaction !== "function") {
     throw new StageError("signing", "Your wallet can't sign transactions. Reconnect Phantom and try again.", {
       submitted: false,
@@ -467,6 +474,13 @@ async function signSendConfirmInner({ connection, transaction, signTransaction, 
         cause: err,
       });
     }
+  }
+
+  // Lets callers record the signature immediately, before waiting for confirmation.
+  try {
+    onSubmitted?.(signature, blockhash);
+  } catch (hookErr) {
+    console.warn("onSubmitted hook failed:", hookErr);
   }
 
   onStage?.("confirming");

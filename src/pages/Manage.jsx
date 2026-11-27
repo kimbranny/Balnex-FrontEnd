@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { useConnectSheet } from "../components/WalletSheet";
 import { PublicKey, Transaction } from "@solana/web3.js";
@@ -14,6 +14,7 @@ import {
   feeStatus,
   verifyFeePaid,
 } from "../lib/fees";
+import { clearPending, evaluatePending, getPending, savePending } from "../lib/feeGuards";
 import { readMint } from "../lib/raydium";
 import { StageError, signSendConfirm, simulateWithCost, toFailure } from "../lib/txRunner";
 import { explorerAddress, explorerTx, fromRawUnits, shorten } from "../lib/utils";
@@ -39,6 +40,15 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
   const [failures, setFailures] = useState({});
   const [results, setResults] = useState({});
 
+  // A different wallet must never inherit selections or a built transaction.
+  const walletKey = publicKey ? publicKey.toBase58() : "";
+  useEffect(() => {
+    setSelection({});
+    setPlans({});
+    setFailures({});
+    setResults({});
+  }, [walletKey]);
+
   const selectedKinds = (mint) => Object.keys(selection[mint] || {}).filter((k) => selection[mint][k]);
 
   function toggle(mint, kind) {
@@ -52,6 +62,32 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
   // controlled by this wallet, then builds + simulates the single combined transaction.
   async function buildPlan(token) {
     if (!fee.ok) throw new StageError("prepare", fee.reason, { submitted: false });
+
+    // 1) An earlier submission for this token might still be in flight or may have landed.
+    //    Never build a second paid transaction until that is settled.
+    for (const entry of getPending(publicKey.toBase58(), token.mint)) {
+      const { value } = await connection.getSignatureStatuses([entry.signature], { searchTransactionHistory: true });
+      const valid = entry.blockhash
+        ? await connection.isBlockhashValid(entry.blockhash, { commitment: "confirmed" }).then((r) => r.value).catch(() => null)
+        : null;
+      const verdict = evaluatePending(value[0], valid);
+      if (verdict === "pending") {
+        throw new StageError(
+          "confirmation",
+          "A previous revocation transaction for this token is still awaiting confirmation. Wait for it to settle before trying again; you won't be charged twice.",
+          { submitted: true, signature: entry.signature, landed: "unknown" }
+        );
+      }
+      clearPending(entry.signature);
+      if (verdict === "confirmed") {
+        await refresh();
+        throw new StageError(
+          "confirmation",
+          "Your previous revocation transaction went through. Your tokens have been refreshed; nothing further was charged.",
+          { submitted: true, signature: entry.signature, landed: "confirmed" }
+        );
+      }
+    }
 
     const mintKey = new PublicKey(token.mint);
     const info = await readMint(connection, token.mint);
@@ -157,6 +193,8 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
         transaction: plan.tx,
         signTransaction,
         sendTransaction,
+        onSubmitted: (sig, blockhash) =>
+          savePending({ wallet: publicKey.toBase58(), mint: token.mint, kinds: plan.kinds, signature: sig, blockhash }),
         onStage: (name) => setStage(labels[name] || ""),
       });
 
@@ -172,7 +210,8 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
           signature,
         });
       }
-      await verifyFeePaid(connection, signature, fee.treasury, plan.total);
+      await verifyFeePaid(connection, signature, publicKey, fee.treasury, plan.total);
+      clearPending(signature);
 
       setResults((prev) => ({ ...prev, [token.mint]: { signature, kinds: plan.kinds, total: plan.total } }));
       setPlans((prev) => ({ ...prev, [token.mint]: undefined }));

@@ -2,6 +2,7 @@
 import { PublicKey, SystemProgram } from "@solana/web3.js";
 import { AuthorityType, createSetAuthorityInstruction } from "@solana/spl-token";
 import { AUTHORITY_FEE_SOL, CLUSTER, MAINNET_FEES_ENABLED, TREASURY_WALLET } from "../config";
+import { findFeeTransfer } from "./feeGuards";
 import { StageError } from "./txRunner";
 import { toRawUnits } from "./utils";
 
@@ -72,9 +73,10 @@ export function buildRevocationInstructions({ owner, mint, programId, kinds, tre
   return instructions;
 }
 
-// Confirms from the confirmed transaction that the treasury really received the fee.
-export async function verifyFeePaid(connection, signature, treasury, feeLamports) {
-  const tx = await connection.getTransaction(signature, {
+// Confirms from the confirmed transaction that it succeeded and contains the exact fee
+// transfer to the treasury.
+export async function verifyFeePaid(connection, signature, owner, treasury, feeLamports) {
+  const tx = await connection.getParsedTransaction(signature, {
     commitment: "confirmed",
     maxSupportedTransactionVersion: 0,
   });
@@ -90,20 +92,11 @@ export async function verifyFeePaid(connection, signature, treasury, feeLamports
       signature,
     });
   }
-  const keys = tx.transaction.message.getAccountKeys();
-  let index = -1;
-  for (let i = 0; i < keys.length; i += 1) {
-    if (keys.get(i).equals(treasury)) {
-      index = i;
-      break;
-    }
-  }
-  const received = index >= 0 ? BigInt(tx.meta.postBalances[index]) - BigInt(tx.meta.preBalances[index]) : 0n;
-  if (received !== feeLamports) {
-    throw new StageError("verification", `The treasury received ${received} lamports, expected ${feeLamports}.`, {
+  if (!findFeeTransfer(tx, owner.toBase58(), treasury.toBase58(), feeLamports)) {
+    throw new StageError("verification", "The confirmed transaction doesn't contain the expected fee transfer.", {
       submitted: true,
       signature,
     });
   }
-  return received;
+  return feeLamports;
 }
