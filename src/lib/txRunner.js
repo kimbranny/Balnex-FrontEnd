@@ -524,3 +524,13 @@ export async function verifyPoolAccount(connection, poolId, programId, signature
   }
   return true;
 }
+
+// Turns any thrown value into the user message + diagnostics pair used by the UI.
+export function toFailure(err) {
+  const stageError =
+    err instanceof StageError
+      ? err
+      : new StageError("unknown", err?.message || String(err) || "Unknown error.", { submitted: null, cause: err });
+  console.error("[BALNEX] transaction failure", describeError(stageError), err);
+  return { info: userMessage(stageError), diag: describeError(stageError) };
+}

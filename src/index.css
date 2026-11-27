@@ -1812,3 +1812,26 @@ textarea:focus {
 .diagnostics summary { cursor: pointer; opacity: .85; }
 .diag-pre { max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-word; background: rgba(0,0,0,.35); padding: 10px; border-radius: 10px; font-size: .75rem; }
 .text-button { background: none; border: 0; color: inherit; text-decoration: underline; cursor: pointer; padding: 6px 0; font: inherit; opacity: .85; }
+
+/* Post-launch pool panels */
+.pool-panel { border: 1px solid rgba(255,255,255,.12); border-radius: 16px; padding: 18px; display: grid; gap: 14px; background: linear-gradient(160deg, rgba(255,43,214,.07), rgba(255,255,255,.03)); backdrop-filter: blur(10px); animation: fadeUp .35s ease both; }
+.pool-panel + .pool-panel { margin-top: 4px; }
+.pool-unavailable { opacity: .9; }
+.pool-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+.pool-head small { display: block; }
+.badges { display: flex; gap: 6px; flex-wrap: wrap; }
+.badge { font-size: .72rem; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(255,255,255,.18); opacity: .9; }
+.badge-ok { border-color: rgba(80,220,140,.5); color: #7ef0b0; }
+.badge-warn { border-color: rgba(255,190,80,.5); color: #ffc76b; }
+.pool-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 0; }
+.pool-grid dt { font-size: .72rem; text-transform: uppercase; letter-spacing: .06em; opacity: .65; }
+.pool-grid dd { margin: 4px 0 0; font-variant-numeric: tabular-nums; word-break: break-word; }
+.copy-row { display: flex; align-items: center; gap: 10px; font-size: .85rem; flex-wrap: wrap; }
+.copy-row span { opacity: .65; min-width: 92px; }
+.copy-row code { font-size: .8rem; }
+.copy-row a { color: var(--accent-hover); text-decoration: none; }
+.danger-button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; width: 100%; padding: 14px 18px; border-radius: 12px; font: inherit; font-weight: 600; cursor: pointer; color: #ff6b7d; background: rgba(255,60,80,.1); border: 1px solid rgba(255,70,90,.7); box-shadow: 0 0 18px rgba(255,60,80,.25); transition: box-shadow .2s, background .2s, transform .1s; }
+.danger-button:hover:not(:disabled) { background: rgba(255,60,80,.2); box-shadow: 0 0 26px rgba(255,60,80,.45); }
+.danger-button:active:not(:disabled) { transform: scale(.99); }
+.danger-button:disabled { opacity: .5; cursor: not-allowed; box-shadow: none; }
+@keyframes fadeUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }

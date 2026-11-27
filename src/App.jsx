@@ -67,7 +67,7 @@ const FAQS = [
   {
     question: "What is Raydium liquidity?",
     answer:
-      "A liquidity pool lets people swap your token for SOL. You deposit both sides to create it, and can add or remove liquidity later from the Liquidity page.",
+      "A liquidity pool lets people swap your token for SOL. You deposit both sides to create it, and can manage or withdraw it from the Liquidity page once the pool is confirmed on-chain.",
   },
 ];
 
@@ -77,7 +77,7 @@ const GUIDE = [
   ["Set authorities", "Decide whether to keep or revoke mint and freeze authority."],
   ["Create the token", "Review, then approve the transaction in your wallet."],
   ["Create a pool", "Pair part of your supply with SOL on Raydium."],
-  ["Manage liquidity", "Add or remove liquidity any time from the Liquidity page."],
+  ["Manage liquidity", "Once your pool is confirmed on-chain, manage and withdraw liquidity from the Liquidity page."],
 ];
 
 export default function App() {
