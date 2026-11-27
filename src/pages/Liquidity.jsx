@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { useConnectSheet } from "../components/WalletSheet";
-import { PublicKey } from "@solana/web3.js";
+import { PublicKey, SystemProgram, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
 import { useToast } from "../components/Toast";
 import { CLUSTER, LAST_POOL_KEY, WSOL_MINT } from "../config";
 import Diagnostics from "../components/Diagnostics";
@@ -17,6 +17,7 @@ import {
   StageError,
   describeError,
   inspectTransaction,
+  rebuildWithoutLookupTables,
   signSendConfirm,
   simulateWithCost,
   userMessage,
@@ -140,6 +141,28 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
     notify("Transaction did not complete. See details below.", "error");
   }
 
+  // Signs (never sends) a harmless self-transfer to show whether this wallet can sign at all.
+  async function handleWalletSelfTest() {
+    if (!publicKey || !signTransaction) return;
+    const results = [];
+    try {
+      const { blockhash } = await connection.getLatestBlockhash("confirmed");
+      const legacy = new VersionedTransaction(
+        new TransactionMessage({
+          payerKey: publicKey,
+          recentBlockhash: blockhash,
+          instructions: [SystemProgram.transfer({ fromPubkey: publicKey, toPubkey: publicKey, lamports: 1 })],
+        }).compileToLegacyMessage()
+      );
+      await signTransaction(legacy);
+      results.push("simple legacy transaction: signed OK");
+    } catch (err) {
+      results.push(`simple legacy transaction: FAILED (${err?.error?.code ?? err?.code ?? "?"} ${err?.error?.message || err?.message})`);
+    }
+    setDiag((prev) => ({ ...(prev || {}), walletSelfTest: results }));
+    notify(results.join(" · "), results.some((r) => r.includes("FAILED")) ? "error" : "success");
+  }
+
   // Step 1: read the mint, build the exact transaction, simulate it and show the full cost.
   async function buildCreatePlan(legacy = false) {
     const mintInfo = await readMint(connection, selected.mint);
@@ -261,45 +284,51 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
         confirming: "Waiting for confirmation…",
       };
       labels["signing-alt"] = "Retrying with Phantom's sign-and-send…";
-      const run = (p) =>
+      const run = (transaction, inspection, transactionFormat, notes) =>
         signSendConfirm({
           connection,
-          transaction: p.prepared.built.transaction,
+          transaction,
           signTransaction,
           sendTransaction,
-          context: { inspection: p.inspection, transactionFormat: p.legacy ? "legacy" : "v0" },
+          context: { inspection, transactionFormat, fallbackNotes: notes },
           onStage: (name) => setStage(labels[name] || ""),
         });
 
       let signature;
       try {
-        ({ signature } = await run(active));
+        ({ signature } = await run(active.prepared.built.transaction, active.inspection, "v0 + lookup table"));
       } catch (err) {
-        // Nothing was sent when signing fails, so a differently-formatted rebuild is safe.
-        // Only try it if the wallet returned its internal error and the first format was v0.
-        if (!(err instanceof StageError && err.stage === "signing" && err.details?.phantomInternal && !active.legacy)) {
+        // Nothing was sent when signing fails, so re-formatting the same instructions is safe.
+        if (!(err instanceof StageError && err.stage === "signing" && err.details?.phantomInternal)) throw err;
+        console.warn("[BALNEX] v0 signing failed with -32603; retrying without lookup tables", describeError(err));
+        setStage("Re-formatting without lookup tables…");
+
+        let legacyTx;
+        let legacyInspection;
+        try {
+          legacyTx = await rebuildWithoutLookupTables(connection, active.prepared.built.transaction, publicKey);
+          legacyInspection = await inspectTransaction(connection, legacyTx, publicKey, active.prepared.programId);
+          if (legacyInspection.problems.length) throw new Error(legacyInspection.problems.join(" "));
+          if (legacyInspection.instructions.length !== active.inspection.instructions.length) {
+            throw new Error("Re-formatted transaction doesn't match the original instructions.");
+          }
+          await simulateWithCost(connection, legacyTx, publicKey);
+        } catch (fallbackErr) {
+          console.warn("[BALNEX] legacy re-format not possible:", fallbackErr);
+          err.details = {
+            ...err.details,
+            fallbackNotes: `Legacy re-format not possible: ${fallbackErr?.message || fallbackErr}`,
+            legacyInspection,
+          };
           throw err;
         }
-        console.warn("[BALNEX] v0 signing failed with -32603; rebuilding as a legacy transaction", describeError(err));
-        setStage("Rebuilding in legacy format…");
-        let legacyPlan;
+
         try {
-          legacyPlan = await buildCreatePlan(true);
+          ({ signature } = await run(legacyTx, legacyInspection, "legacy (no lookup table)", "Retried after v0 -32603"));
         } catch (legacyErr) {
-          // Report the original signing failure, plus why the fallback wasn't possible.
-          err.details = { ...err.details, legacyFallback: legacyErr?.message || String(legacyErr) };
-          throw err;
-        }
-        if (legacyPlan.cost.total > active.cost.total * 1.02 + 10000) {
-          setPlan(legacyPlan);
-          throw new StageError("prepare", "The legacy-format cost differs from what you approved. Review it and confirm again.", { submitted: false });
-        }
-        active = legacyPlan;
-        setPlan(legacyPlan);
-        try {
-          ({ signature } = await run(legacyPlan));
-        } catch (legacyErr) {
-          if (legacyErr instanceof StageError) legacyErr.details = { ...legacyErr.details, v0Attempts: err.details?.attempts };
+          if (legacyErr instanceof StageError) {
+            legacyErr.details = { ...legacyErr.details, v0Attempts: err.details?.attempts, v0Inspection: active.inspection };
+          }
           throw legacyErr;
         }
       }
@@ -565,6 +594,11 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
               </p>
             )}
             <Diagnostics data={diag} />
+            {errInfo?.title === "Wallet signing failed" && (
+              <button type="button" className="text-button" onClick={handleWalletSelfTest}>
+                Test whether my wallet can sign at all (nothing is sent)
+              </button>
+            )}
           </div>
         </div>
       )}

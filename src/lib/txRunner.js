@@ -3,7 +3,7 @@
 // Splits "build -> simulate -> sign -> submit -> confirm -> verify" into separate
 // steps so a failure always says WHICH step failed, and whether anything was sent.
 // It never touches private keys; the wallet signs inside the wallet app.
-import { PublicKey, SystemProgram, VersionedTransaction } from "@solana/web3.js";
+import { PublicKey, SystemProgram, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
 
 const KNOWN_PROGRAMS = {
   [SystemProgram.programId.toBase58()]: "System",
@@ -68,6 +68,8 @@ export function describeError(error) {
     message: error?.message,
     submitted: details.submitted ?? null,
     inspection: details.inspection ?? null,
+    transactionFormat: details.transactionFormat ?? null,
+    fallbackNotes: details.fallbackNotes ?? null,
     signingAttempts: details.attempts ?? null,
     walletErrorCode: inner?.code ?? null,
     walletErrorMessage: inner?.message ?? null,
@@ -140,6 +142,28 @@ export function userMessage(error) {
     outcome: "We couldn't tell how far it got. Check your wallet activity before retrying.",
     body: error?.message || "Unknown error.",
   };
+}
+
+// Re-compiles the SAME instructions without Address Lookup Tables (as a legacy message),
+// with a fresh blockhash. No instruction is added, removed or reordered; the caller
+// re-inspects and re-simulates the result before the wallet sees it.
+export async function rebuildWithoutLookupTables(connection, tx, feePayer) {
+  const message = messageOf(tx);
+  const lookups = message.addressTableLookups || [];
+  const alts = (
+    await Promise.all(lookups.map((l) => connection.getAddressLookupTable(l.accountKey).catch(() => null)))
+  )
+    .map((r) => r?.value)
+    .filter(Boolean);
+  if (alts.length !== lookups.length) {
+    throw new StageError("prepare", "Couldn't load the lookup table needed to rebuild the transaction.", { submitted: false });
+  }
+
+  const decompiled = TransactionMessage.decompile(message, { addressLookupTableAccounts: alts });
+  const { blockhash } = await connection.getLatestBlockhash("confirmed");
+  decompiled.recentBlockhash = blockhash;
+  decompiled.payerKey = feePayer;
+  return new VersionedTransaction(decompiled.compileToLegacyMessage());
 }
 
 // Looks inside the transaction BEFORE the wallet sees it. Contains only public data
