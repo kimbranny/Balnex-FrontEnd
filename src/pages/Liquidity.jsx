@@ -7,7 +7,7 @@ import { CLUSTER, WSOL_MINT } from "../config";
 import Diagnostics from "../components/Diagnostics";
 import LaunchCard from "../components/LaunchCard";
 import PoolPanel from "../components/PoolPanel";
-import { completeLaunch, useActiveLaunch } from "../lib/launch";
+import { markLiquidityCreated, markLiquidityRemoved, useActiveLaunch } from "../lib/launch";
 import RemoveLiquidity from "../components/RemoveLiquidity";
 import { deletePoolRecord, loadPoolRecords, savePoolRecord, verifyPool } from "../lib/pools";
 import { loadRaydium, prepareCreatePool, readMint } from "../lib/raydium";
@@ -68,12 +68,25 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   const verifyRun = useRef(0);
   const launch = useActiveLaunch(owner);
 
-  // Releases the launch lock ONLY when the chain check passed: pool account exists on
-  // this network, creation tx has no error, and both reserves hold liquidity.
+  // Lifecycle sync from CHAIN-verified pool data. Creating a pool moves the launch to
+  // liquidity_created but keeps the wallet locked; a pool that is verifiably drained on-chain
+  // completes it. (BALNEX's own removal flow completes it too: see handleWithdrawn.)
   useEffect(() => {
     if (!launch) return;
-    const done = records.find((r) => r.mint === launch.mint && verifiedMap[r.poolId]?.status === "verified");
-    if (done) completeLaunch(launch.wallet, launch.mint, done.poolId);
+    const rec = records.find((r) => r.mint === launch.mint);
+    const v = rec ? verifiedMap[rec.poolId] : null;
+    if (!rec || !v) return;
+    if (launch.status === "launch_pending" && v.status === "verified") {
+      markLiquidityCreated(launch.wallet, launch.mint, {
+        poolId: rec.poolId,
+        lpMint: v.lpMint,
+        creationSignature: rec.signature,
+        tokenDeposited: rec.tokenDeposited,
+        solDeposited: rec.solDeposited,
+      });
+    } else if (launch.status === "liquidity_created" && v.status === "emptied") {
+      markLiquidityRemoved(launch.wallet, launch.mint, null, { reason: "pool_emptied_on_chain" });
+    }
   }, [launch, records, verifiedMap]);
 
   const usable = useMemo(
@@ -136,6 +149,23 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   async function refreshPool(record) {
     const result = await verifyOne(record);
     setVerifiedMap((prev) => ({ ...prev, [record.poolId]: result }));
+    return result;
+  }
+
+  // Called after a withdrawal transaction CONFIRMED. The wallet unlocks only if the chain now
+  // shows this wallet holds no LP tokens for the pool (a full removal). Partial removals keep
+  // the lock because liquidity is still in the pool.
+  async function handleWithdrawn(record, signature) {
+    const result = await refreshPool(record);
+    const closed = (result.status === "verified" || result.status === "emptied") && result.lpRaw === 0n;
+    if (!closed) {
+      notify("Withdrawal confirmed. Some liquidity remains, so your launch stays active until all of it is removed.", "info");
+      return;
+    }
+    savePoolRecord({ ...record, removalSignature: signature, removedAt: Date.now() });
+    markLiquidityRemoved(record.owner, record.mint, signature, { poolId: record.poolId });
+    setRecordsVersion((v) => v + 1);
+    notify("All liquidity removed and confirmed on-chain. You can create your next token.", "success");
   }
 
   function forget(record) {
@@ -365,6 +395,15 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
         createdAt: Date.now(),
       };
       savePoolRecord(record);
+      // Update the EXISTING launch record for this mint in place (no second record).
+      // The wallet stays locked; only confirmed liquidity removal unlocks it.
+      markLiquidityCreated(publicKey.toBase58(), selected.mint, {
+        poolId: record.poolId,
+        lpMint: record.lpMint,
+        creationSignature: signature,
+        tokenDeposited: record.tokenDeposited,
+        solDeposited: record.solDeposited,
+      });
       setPlan(null);
       setShowCreate(false);
       setManaging("");
@@ -458,7 +497,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
               sendTransaction={sendTransaction}
               notify={notify}
               onBack={() => setManaging("")}
-              onChanged={() => refreshPool(managingRecord)}
+              onChanged={(signature) => handleWithdrawn(managingRecord, signature)}
             />
           ) : (
             records.map((record) => {

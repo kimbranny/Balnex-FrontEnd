@@ -10,10 +10,34 @@ import { fetchPool } from "./raydium";
 
 const KEY = `balnex:pools:v1:${CLUSTER}`;
 
+// One pool record per (owner, mint). If duplicates exist (older data, retries), they are merged
+// into a single record, preferring the one that carries the successful pool data
+// (creation signature + LP mint), then the newest.
+export function mergePoolRecords(list) {
+  const score = (r) => (r.signature ? 2 : 0) + (r.lpMint ? 1 : 0);
+  const byKey = new Map();
+  for (const record of list) {
+    const key = `${record.owner}:${record.mint || record.poolId}`;
+    const current = byKey.get(key);
+    if (!current) {
+      byKey.set(key, record);
+      continue;
+    }
+    const [best, other] =
+      score(record) > score(current) || (score(record) === score(current) && (record.createdAt || 0) > (current.createdAt || 0))
+        ? [record, current]
+        : [current, record];
+    byKey.set(key, { ...other, ...Object.fromEntries(Object.entries(best).filter(([, v]) => v !== undefined && v !== null)) });
+  }
+  return [...byKey.values()];
+}
+
 export function loadPoolRecords() {
   try {
     const list = JSON.parse(localStorage.getItem(KEY) || "[]");
-    return Array.isArray(list) ? list.filter((r) => r && r.poolId && r.owner && r.cluster === CLUSTER) : [];
+    return Array.isArray(list)
+      ? mergePoolRecords(list.filter((r) => r && r.poolId && r.owner && r.cluster === CLUSTER))
+      : [];
   } catch {
     return [];
   }
@@ -28,8 +52,8 @@ function write(list) {
 }
 
 export function savePoolRecord(record) {
-  const rest = loadPoolRecords().filter((r) => !(r.poolId === record.poolId && r.owner === record.owner));
-  write([record, ...rest]);
+  // The mint is the canonical key: saving a pool for a mint updates that mint's record.
+  write(mergePoolRecords([record, ...loadPoolRecords()]));
 }
 
 export function deletePoolRecord(poolId, owner) {
@@ -80,10 +104,6 @@ export async function verifyPool({ connection, getRaydium, record, owner }) {
       token: Number(solIsA ? poolInfo.mintAmountB : poolInfo.mintAmountA),
       sol: Number(solIsA ? poolInfo.mintAmountA : poolInfo.mintAmountB),
     };
-    if (!(reserves.token > 0 && reserves.sol > 0)) {
-      return { status: "invalid", message: "The pool exists but holds no liquidity." };
-    }
-
     const lpMint = poolInfo.lpMint.address;
     const [accounts, supply] = await Promise.all([
       connection.getParsedTokenAccountsByOwner(owner, { mint: new PublicKey(lpMint) }),
@@ -94,8 +114,7 @@ export async function verifyPool({ connection, getRaydium, record, owner }) {
       0n
     );
 
-    return {
-      status: "verified",
+    const base = {
       txStatus,
       poolInfo,
       poolKeys: data.poolKeys,
@@ -107,6 +126,12 @@ export async function verifyPool({ connection, getRaydium, record, owner }) {
       tokenSymbol: (solIsA ? poolInfo.mintB : poolInfo.mintA).symbol || "",
       checkedAt: Date.now(),
     };
+
+    // A pool with no reserves has been fully drained (e.g. after all liquidity was removed).
+    if (!(reserves.token > 0 && reserves.sol > 0)) {
+      return { status: "emptied", message: "All liquidity has been removed from this pool.", ...base };
+    }
+    return { status: "verified", ...base };
   } catch (err) {
     console.error("[BALNEX] pool verification error", err);
     return { status: "error", message: `Couldn't verify this pool right now: ${err?.message || err}` };

@@ -31,6 +31,26 @@ function CopyRow({ label, value, href }) {
 export default function PoolPanel({ record, verified, onRemove, onForget }) {
   const label = record.symbol ? `$${record.symbol}` : shorten(record.mint, 4, 4);
 
+  if (verified?.status === "emptied" || (verified?.status === "verified" && record.removedAt && verified.lpRaw === 0n)) {
+    return (
+      <div className="pool-panel">
+        <div className="pool-head">
+          <strong>{label} / SOL</strong>
+          <div className="badges">
+            <span className="badge">{CLUSTER === "devnet" ? "Devnet" : "Mainnet"}</span>
+            <span className="badge">Liquidity removed</span>
+          </div>
+        </div>
+        <p className="helper">This launch is complete. The pool is kept here as history.</p>
+        <CopyRow label="Pool address" value={record.poolId} href={explorerAddress(record.poolId)} />
+        {record.signature && <CopyRow label="Creation tx" value={record.signature} href={explorerTx(record.signature)} />}
+        {record.removalSignature && (
+          <CopyRow label="Removal tx" value={record.removalSignature} href={explorerTx(record.removalSignature)} />
+        )}
+      </div>
+    );
+  }
+
   if (verified?.status && verified.status !== "verified") {
     return (
       <div className="pool-panel pool-unavailable">

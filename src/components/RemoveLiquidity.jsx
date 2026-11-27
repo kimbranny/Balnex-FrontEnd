@@ -74,7 +74,7 @@ export default function RemoveLiquidity({
       setPercent("");
       notify("Liquidity withdrawn.", "success");
       setStage("Refreshing your position…");
-      await onChanged();
+      await onChanged(signature);
     } catch (err) {
       setFailure(toFailure(err));
       notify("Withdrawal did not complete. See details below.", "error");

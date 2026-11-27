@@ -20,11 +20,17 @@ export default function LaunchCard({ launch, onContinue }) {
       <div className="pool-head">
         <div>
           <strong>Launch in progress</strong>
-          <small className="helper">Finish this launch before creating another token.</small>
+          <small className="helper">
+            {launch.status === "liquidity_created"
+              ? "Remove all liquidity from your pool to finish this launch and create another token."
+              : "Finish this launch before creating another token."}
+          </small>
         </div>
         <div className="badges">
           <span className="badge">{CLUSTER === "devnet" ? "Devnet" : "Mainnet"}</span>
-          <span className="badge badge-warn">Pool not created yet</span>
+          <span className={launch.status === "liquidity_created" ? "badge badge-ok" : "badge badge-warn"}>
+            {launch.status === "liquidity_created" ? "Pool live" : "Pool not created yet"}
+          </span>
         </div>
       </div>
 
@@ -53,18 +59,20 @@ export default function LaunchCard({ launch, onContinue }) {
         </div>
         <div>
           <dt>Status</dt>
-          <dd>Token created · waiting for pool</dd>
+          <dd>{launch.status === "liquidity_created" ? "Pool created · liquidity active" : "Token created · waiting for pool"}</dd>
         </div>
       </dl>
 
       {onContinue && (
         <button type="button" className="primary" onClick={onContinue}>
-          Continue Current Launch <span>→</span>
+          {launch.status === "liquidity_created" ? "Manage Pool" : "Continue Current Launch"} <span>→</span>
         </button>
       )}
-      <button type="button" className="text-button danger-text" onClick={() => setOpen(true)}>
-        Abandon This Launch
-      </button>
+      {launch.status === "launch_pending" && (
+        <button type="button" className="text-button danger-text" onClick={() => setOpen(true)}>
+          Abandon This Launch
+        </button>
+      )}
 
       {open && <AbandonDialog launch={launch} onClose={() => setOpen(false)} />}
     </div>

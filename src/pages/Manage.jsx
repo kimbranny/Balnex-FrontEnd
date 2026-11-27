@@ -1,11 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { useConnectSheet } from "../components/WalletSheet";
 import { PublicKey, Transaction } from "@solana/web3.js";
 import { getMint } from "@solana/spl-token";
 import Diagnostics from "../components/Diagnostics";
 import { useToast } from "../components/Toast";
-import { CLUSTER } from "../config";
+import { CLUSTER, WSOL_MINT } from "../config";
+import { useLaunches } from "../lib/launch";
+import { loadPoolRecords } from "../lib/pools";
 import {
   AUTHORITIES,
   FEE_PER_AUTHORITY_LAMPORTS,
@@ -32,6 +34,40 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
   const { tokens, loading, error, refresh } = walletTokens;
 
   const fee = feeStatus();
+
+  // ONE entry per mint. The mint address is the canonical key:
+  //  - LP tokens (and wrapped SOL) are pool plumbing, not separate tokens, so they're hidden;
+  //  - launches that are no longer held in the wallet stay visible as history;
+  //  - anything left is de-duplicated by mint.
+  const owner = publicKey ? publicKey.toBase58() : "";
+  const launches = useLaunches(owner);
+  const poolRecords = useMemo(
+    () => (owner ? loadPoolRecords().filter((r) => r.owner === owner) : []),
+    [owner, launches]
+  );
+  const displayTokens = useMemo(() => {
+    const lpMints = new Set([...poolRecords.map((r) => r.lpMint), ...launches.map((l) => l.lpMint)].filter(Boolean));
+    const byMint = new Map();
+    for (const token of tokens) {
+      if (lpMints.has(token.mint) || token.mint === WSOL_MINT) continue;
+      byMint.set(token.mint, token);
+    }
+    for (const launch of launches) {
+      if (byMint.has(launch.mint)) continue;
+      byMint.set(launch.mint, {
+        mint: launch.mint,
+        decimals: launch.decimals ?? 0,
+        raw: 0n,
+        uiAmount: 0,
+        mintAuthority: null,
+        freezeAuthority: null,
+        name: launch.name || "",
+        symbol: launch.symbol || "",
+        historical: true,
+      });
+    }
+    return [...byMint.values()];
+  }, [tokens, poolRecords, launches]);
   const lock = useRef(false); // blocks double-clicks / duplicate submissions
 
   const [selection, setSelection] = useState({}); // { [mint]: { mint: bool, freeze: bool } }
@@ -308,7 +344,7 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
         </div>
       )}
 
-      {!loading && !error && tokens.length === 0 && (
+      {!loading && !error && displayTokens.length === 0 && (
         <div className="empty-state">
           <strong>No tokens yet</strong>
           <p>This wallet doesn't hold any SPL tokens on this network.</p>
@@ -319,7 +355,7 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
       )}
 
       <div className="token-list">
-        {tokens.map((token) => {
+        {displayTokens.map((token) => {
           const wallet = publicKey?.toBase58();
           const canRevokeMint = token.mintAuthority && token.mintAuthority === wallet;
           const canRevokeFreeze = token.freezeAuthority && token.freezeAuthority === wallet;
@@ -341,6 +377,8 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
                 </div>
               </div>
 
+              {!token.historical && (
+                <>
               {["mint", "freeze", "update"].map((kind) => {
                 const def = AUTHORITIES[kind];
                 const meta = metaMap[token.mint];
@@ -505,11 +543,85 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
                 );
               })()}
 
+                </>
+              )}
+
+              {(() => {
+                const launch = launches.find((l) => l.mint === token.mint);
+                if (!launch) return null;
+                const labels = {
+                  launch_pending: ["Pool not created yet", "badge badge-warn"],
+                  liquidity_created: ["Pool live", "badge badge-ok"],
+                  completed: ["Launch complete · liquidity removed", "badge"],
+                  abandoned: ["Launch abandoned", "badge"],
+                };
+                const [text, cls] = labels[launch.status] || ["", "badge"];
+                return (
+                  <div className="cost-box">
+                    <div className="pool-head">
+                      <strong>Launch</strong>
+                      <span className={cls}>{text}</span>
+                    </div>
+                    {launch.poolId && (
+                      <dl className="cost-list">
+                        <dt>Pool (Raydium CPMM)</dt>
+                        <dd>
+                          <a href={explorerAddress(launch.poolId)} target="_blank" rel="noopener noreferrer">
+                            {shorten(launch.poolId, 6, 6)} ↗
+                          </a>
+                        </dd>
+                        {launch.tokenDeposited && (
+                          <>
+                            <dt>Initial token liquidity</dt>
+                            <dd>{launch.tokenDeposited}</dd>
+                          </>
+                        )}
+                        {launch.solDeposited && (
+                          <>
+                            <dt>Initial SOL liquidity</dt>
+                            <dd>{fromRawUnits(BigInt(launch.solDeposited), 9)} SOL</dd>
+                          </>
+                        )}
+                        {launch.creationSignature && (
+                          <>
+                            <dt>Pool creation tx</dt>
+                            <dd>
+                              <a href={explorerTx(launch.creationSignature)} target="_blank" rel="noopener noreferrer">
+                                {shorten(launch.creationSignature, 6, 6)} ↗
+                              </a>
+                            </dd>
+                          </>
+                        )}
+                        {launch.removalSignature && (
+                          <>
+                            <dt>Removal tx</dt>
+                            <dd>
+                              <a href={explorerTx(launch.removalSignature)} target="_blank" rel="noopener noreferrer">
+                                {shorten(launch.removalSignature, 6, 6)} ↗
+                              </a>
+                            </dd>
+                          </>
+                        )}
+                      </dl>
+                    )}
+                    {launch.status === "liquidity_created" && (
+                      <button type="button" className="secondary-button compact" onClick={() => onNavigate("liquidity")}>
+                        Manage pool / Remove Liquidity →
+                      </button>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {token.historical && <p className="helper">This token is no longer held by this wallet. Kept here as launch history.</p>}
+
+              {!token.historical && !launches.some((l) => l.mint === token.mint && (l.poolId || l.status === "completed")) && (
               <div className="token-actions">
                 <button type="button" className="secondary-button compact" onClick={() => onUseForLiquidity(token.mint)}>
                   Create pool →
                 </button>
               </div>
+              )}
             </article>
           );
         })}
