@@ -13,6 +13,7 @@ import { deletePoolRecord, loadPoolRecords, savePoolRecord, verifyPool } from ".
 import { loadRaydium, prepareCreatePool, readMint } from "../lib/raydium";
 import {
   StageError,
+  describeError,
   inspectTransaction,
   rebuildWithoutLookupTables,
   signSendConfirm,
