@@ -2,6 +2,7 @@
 // The authoritative lifecycle state now lives in one application-wide lock.
 export {
   abandonLaunch,
+  acquireCrossTabOperationLock,
   beginLifecycleOperation,
   getActiveLaunch,
   getLaunches,
