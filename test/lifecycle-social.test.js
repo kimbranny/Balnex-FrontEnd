@@ -37,22 +37,24 @@ test("global lifecycle blocks a second token and persists across reads", () => {
 test("synchronous operation guard blocks concurrent pool attempts", () => {
   localStorage.clear();
   reserve();
+  lifecycle.markTokenCreated({ wallet, mint: mintA, name: "Token A", symbol: "A" });
   const first = lifecycle.beginLifecycleOperation({
-    mint: mintA, type: "pool_create", allowedStates: ["TOKEN_RESERVED"], pendingStatus: "POOL_PENDING",
+    mint: mintA, type: "pool_create", allowedStates: ["TOKEN_CREATED"], pendingStatus: "POOL_PENDING",
   });
   assert.throws(() => lifecycle.beginLifecycleOperation({
     mint: mintA, type: "pool_create", allowedStates: ["POOL_PENDING"], pendingStatus: "POOL_PENDING",
   }), /already running/i);
   first.update("failed_no_submission", { reason: "wallet signing rejected" });
   first.release();
-  assert.equal(lifecycle.getLifecycleLock().status, "TOKEN_RESERVED");
+  assert.equal(lifecycle.getLifecycleLock().status, "TOKEN_CREATED");
 });
 
 test("unknown submitted transaction blocks blind retry", () => {
   localStorage.clear();
   reserve();
+  lifecycle.markTokenCreated({ wallet, mint: mintA, name: "Token A", symbol: "A" });
   const op = lifecycle.beginLifecycleOperation({
-    mint: mintA, type: "pool_create", allowedStates: ["TOKEN_RESERVED"], pendingStatus: "POOL_PENDING",
+    mint: mintA, type: "pool_create", allowedStates: ["TOKEN_CREATED"], pendingStatus: "POOL_PENDING",
   });
   op.update("submitted", { signature: "test-signature", poolId: pool });
   op.update("unknown", { signature: "test-signature", poolId: pool, reason: "RPC unavailable" });
