@@ -25,6 +25,7 @@ import LaunchCard from "./components/LaunchCard";
 import { beginLifecycleOperation, getLifecycleLock, markTokenCreated, replaceReservedMint, reserveTokenLifecycle, useActiveLaunch, useLifecycleLock } from "./lib/launch";
 import { createMetadataInstruction } from "./lib/metadata";
 import { MAX_NAME_BYTES, MAX_SYMBOL_BYTES } from "./lib/metadataCodec";
+import { signatureFromSignedTransaction } from "./lib/txRunner";
 import Manage from "./pages/Manage";
 import Trending from "./pages/Trending";
 
@@ -260,6 +261,7 @@ export default function App() {
     let mintKeypair = null;
     let walletSigned = false;
     let submittedSignature = null;
+    let signedSignature = null;
     try {
       const wallet = publicKey.toBase58();
       const existing = getLifecycleLock();
@@ -431,13 +433,15 @@ export default function App() {
       });
       const signedTransaction = await signTransaction(transaction);
       walletSigned = true;
-      lifecycleOperation.update("signed");
+      signedSignature = signatureFromSignedTransaction(signedTransaction);
+      lifecycleOperation.update("signed", { ...(signedSignature ? { signature: signedSignature } : {}) });
 
       // Persist submission intent BEFORE the RPC call. If the tab closes while the RPC
       // response is in flight, startup recovery must not offer a blind retry.
       lifecycleOperation.update("submitted", {
         blockhash: latestBlockhash.blockhash,
         lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+        ...(signedSignature ? { signature: signedSignature } : {}),
         reason: "Token transaction submission is in progress; signature not returned yet.",
       });
       const signature = await connection.sendRawTransaction(signedTransaction.serialize(), {
@@ -512,7 +516,7 @@ export default function App() {
         try {
           if (submittedSignature || walletSigned) {
             lifecycleOperation.update("unknown", {
-              ...(submittedSignature ? { signature: submittedSignature } : {}),
+              ...(submittedSignature || signedSignature ? { signature: submittedSignature || signedSignature } : {}),
               reason: "Token transaction submission or confirmation outcome is uncertain.",
             });
           } else {
