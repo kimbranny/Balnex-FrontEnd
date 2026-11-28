@@ -180,8 +180,10 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   }, [lifecycleLock?.id, connection, publicKey, verifyOne]);
 
   const usable = useMemo(
-    () => walletTokens.tokens.filter((token) => token.raw > 0n && token.mint !== WSOL_MINT),
-    [walletTokens.tokens]
+    () => walletTokens.tokens.filter((token) =>
+      token.raw > 0n && token.mint !== WSOL_MINT && (!lifecycleLock || token.mint === lifecycleLock.mint)
+    ),
+    [walletTokens.tokens, lifecycleLock?.mint]
   );
   const lockedMint = lifecycleLock?.mint || "";
   const selected = usable.find((token) => token.mint === (lockedMint || selectedMint)) || null;
@@ -607,7 +609,11 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
 
   const managingRecord = records.find((r) => r.poolId === managing);
   const managingVerified = managingRecord ? verifiedMap[managingRecord.poolId] : null;
-  const showForm = records.length === 0 || showCreate;
+  const showForm = Boolean(
+    lifecycleLock &&
+    ["TOKEN_CREATED", "POOL_PENDING", "RECOVERY_REQUIRED"].includes(lifecycleLock.status) &&
+    !records.some((record) => record.mint === lifecycleLock.mint)
+  );
   const isLockedToken = Boolean(lifecycleLock && selected?.mint === lifecycleLock.mint);
 
   return (
@@ -721,11 +727,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
             })
           )}
 
-          {!managingRecord && (
-            <button type="button" className="secondary-button" onClick={() => setShowCreate((v) => !v)}>
-              {showCreate ? "Hide pool creation" : "Launch another pool"}
-            </button>
-          )}
+
         </div>
       )}
 
@@ -737,8 +739,8 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
             </div>
           ) : usable.length === 0 ? (
             <div className="empty-state">
-              <strong>No tokens to pool</strong>
-              <p>Create a token first, or switch to a wallet that holds one.</p>
+              <strong>{lifecycleLock ? "Locked token not available in this wallet" : "No token lifecycle is reserved"}</strong>
+              <p>{lifecycleLock ? "Reconnect the wallet that owns the locked token to continue. The global lock remains active." : "Create a token first. BALNEX will reserve its lifecycle before pool creation."}</p>
               <button className="primary" type="button" onClick={() => onNavigate("create")}>
                 Create a token <span>→</span>
               </button>
