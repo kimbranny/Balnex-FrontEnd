@@ -503,8 +503,11 @@ async function signSendConfirmInner({ connection, transaction, signTransaction, 
       if (!logs && typeof err?.getLogs === "function") {
         logs = await err.getLogs(connection).catch(() => null);
       }
-      throw new StageError("submission", `${err?.message || "The network rejected the transaction."} ${lastLogLine(logs)}`.trim(), {
-        submitted: false,
+      const submissionMessage = err?.message || "The network rejected the transaction.";
+      const ambiguous = /timeout|timed out|fetch failed|network|socket|ECONN|429|502|503|504|connection reset|failed to fetch/i.test(submissionMessage);
+      throw new StageError("submission", `${submissionMessage} ${lastLogLine(logs)}`.trim(), {
+        submitted: ambiguous,
+        landed: ambiguous ? "unknown" : "failed",
         logs,
         attempts,
         cause: err,
