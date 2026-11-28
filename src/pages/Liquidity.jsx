@@ -123,6 +123,10 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
               return;
             }
           }
+          if (lifecycleLock.operation?.type === "token_create" && mintInfo) {
+            markOperationOutcome("unknown", { signature: failedSignature, reason: "Token creation signature failed, but the reserved mint account exists. Verify its SPL mint state before retrying." });
+            return;
+          }
           markOperationOutcome("failed_submitted", {
             signature: failedSignature,
             reason: "A recorded lifecycle transaction failed on-chain. The operation can be retried only after current state verification.",
@@ -667,7 +671,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   const managingVerified = managingRecord ? verifiedMap[managingRecord.poolId] : null;
   const showForm = Boolean(
     lifecycleLock &&
-    ["TOKEN_CREATED", "POOL_PENDING", "RECOVERY_REQUIRED"].includes(lifecycleLock.status) &&
+    ["TOKEN_CREATED", "POOL_PENDING"].includes(lifecycleLock.status) &&
     !records.some((record) => record.mint === lifecycleLock.mint)
   );
   const isLockedToken = Boolean(lifecycleLock && selected?.mint === lifecycleLock.mint);
