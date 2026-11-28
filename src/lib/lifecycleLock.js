@@ -64,6 +64,45 @@ function corruptedLock(reason) {
   };
 }
 
+// Web Locks serialize lifecycle actions across same-origin tabs where supported.
+// The persistent localStorage lifecycle record remains authoritative across reloads.
+export async function acquireCrossTabOperationLock() {
+  if (typeof navigator === "undefined" || !navigator.locks?.request) {
+    return { supported: false, release() {} };
+  }
+  let resolveAcquired;
+  const acquiredPromise = new Promise((resolve) => { resolveAcquired = resolve; });
+  let releaseHold;
+  const holdPromise = new Promise((resolve) => { releaseHold = resolve; });
+  const request = navigator.locks.request(
+    "balnex:global-token-lifecycle-operation",
+    { mode: "exclusive", ifAvailable: true },
+    async (lock) => {
+      resolveAcquired(Boolean(lock));
+      if (lock) await holdPromise;
+    },
+  );
+  request.catch((error) => {
+    console.warn("[BALNEX] Cross-tab lifecycle lock unavailable:", error);
+    resolveAcquired(false);
+  });
+  const acquired = await acquiredPromise;
+  if (!acquired) {
+    releaseHold();
+    return null;
+  }
+  let released = false;
+  return {
+    supported: true,
+    release() {
+      if (!released) {
+        released = true;
+        releaseHold();
+      }
+    },
+  };
+}
+
 export function getLifecycleLock() {
   let lock = null;
   try {
