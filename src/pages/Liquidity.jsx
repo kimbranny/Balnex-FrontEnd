@@ -1011,7 +1011,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
                     <button className="secondary-button" type="button" disabled={busy} onClick={() => setPlan(null)}>
                       Edit
                     </button>
-                    <button className="primary" type="button" disabled={busy} onClick={handleConfirmPool}>
+                    <button className="primary" type="button" disabled={busy || !isLockedToken} onClick={handleConfirmPool}>
                       {busy ? stage || "Working…" : "Confirm and open wallet"}
                     </button>
                   </div>
@@ -1029,7 +1029,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
                     </div>
                   </div>
 
-                  <button className="primary" type="button" disabled={busy} onClick={handleReviewPool}>
+                  <button className="primary" type="button" disabled={busy || !isLockedToken} onClick={handleReviewPool}>
                     {busy ? stage || "Checking…" : "Review pool cost"}
                     {!busy && <span> →</span>}
                   </button>
