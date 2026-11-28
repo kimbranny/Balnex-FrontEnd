@@ -5,7 +5,7 @@ export default function LaunchCard({ launch, onContinue }) {
   if (!launch) return null;
   const lifecycle = launch.lifecycleStatus || (launch.status === "liquidity_created" ? "POOL_RUNNING" : "TOKEN_CREATED");
   const label = launch.symbol ? `$${launch.symbol}` : shorten(launch.mint, 4, 4);
-  const safeSigningRetry = lifecycle === "TOKEN_RESERVED" && launch.operation?.state === "failed_no_submission";
+  const safeSigningRetry = launch.cluster === CLUSTER && lifecycle === "TOKEN_RESERVED" && launch.operation?.state === "failed_no_submission";
   const recovery = lifecycle === "RECOVERY_REQUIRED" || ["unknown", "submitted", "failed_submitted"].includes(launch.operation?.state) || Boolean(launch.recovery) || safeSigningRetry;
 
   return (
