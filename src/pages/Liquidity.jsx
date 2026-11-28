@@ -13,7 +13,6 @@ import { deletePoolRecord, loadPoolRecords, savePoolRecord, verifyPool } from ".
 import { loadRaydium, prepareCreatePool, readMint } from "../lib/raydium";
 import {
   StageError,
-  describeError,
   inspectTransaction,
   refreshTransactionBlockhash,
   signSendConfirm,
@@ -226,6 +225,12 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
 
     const raydium = await getRaydium();
     const prepared = await prepareCreatePool(raydium, { mintInfo, tokenRaw, solRaw, legacy });
+    if (!prepared.poolId) {
+      throw new StageError("prepare", "Raydium did not return the deterministic pool address. BALNEX stopped before signing because it cannot safely check for an existing pool.", {
+        submitted: false,
+        programId: prepared.programId,
+      });
+    }
     if (prepared.poolId) {
       const existing = await connection.getAccountInfo(new PublicKey(prepared.poolId), "confirmed");
       if (existing) {
