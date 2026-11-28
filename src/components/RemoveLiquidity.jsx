@@ -129,7 +129,18 @@ export default function RemoveLiquidity({
           submittedSignature = signature;
           lifecycleOp.update("submitted", { signature, poolId: record.poolId });
         },
-        onStage: (name) => setStage(({ signing: "Waiting for Phantom approval…", submitting: "Sending…", confirming: "Waiting for confirmation…" })[name] || ""),
+        onStage: (name) => {
+          setStage(({ signing: "Waiting for Phantom approval…", submitting: "Sending…", confirming: "Waiting for confirmation…" })[name] || "");
+          if (name === "signing") lifecycleOp.update("signing", {
+            poolId: record.poolId, blockhash: refreshed.blockhash, lastValidBlockHeight: refreshed.lastValidBlockHeight,
+            lpBalanceBefore: current.lpRaw.toString(), reservesBefore: current.reserves,
+          });
+          if (name === "submitting") lifecycleOp.update("submitted", {
+            poolId: record.poolId, blockhash: refreshed.blockhash, lastValidBlockHeight: refreshed.lastValidBlockHeight,
+            lpBalanceBefore: current.lpRaw.toString(), reservesBefore: current.reserves,
+            reason: "Removal submission is in progress; signature not returned yet.",
+          });
+        },
       });
 
       setStage("Verifying withdrawal on-chain…");
