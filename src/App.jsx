@@ -1167,7 +1167,7 @@ export default function App() {
         </div>
         <p>Built for the Solana ecosystem.</p>
         <div className="footer-links">
-          <button type="button" onClick={() => navigate("create")}>Create</button>
+          <button type="button" disabled={Boolean(lifecycleLock)} title={lifecycleLock ? "Complete the locked token's liquidity lifecycle first." : undefined} onClick={() => navigate("create")}>Create</button>
           <button type="button" onClick={() => navigate("tokens")}>My Tokens</button>
           <button type="button" onClick={() => navigate("liquidity")}>Liquidity</button>
           <button type="button" onClick={() => navigate("help")}>Help</button>
