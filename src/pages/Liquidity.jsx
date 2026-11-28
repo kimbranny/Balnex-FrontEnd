@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { useConnectSheet } from "../components/WalletSheet";
-import { SystemProgram, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
+import { PublicKey, SystemProgram, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
 import { useToast } from "../components/Toast";
 import { CLUSTER, WSOL_MINT } from "../config";
 import Diagnostics from "../components/Diagnostics";
@@ -227,7 +227,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
     const raydium = await getRaydium();
     const prepared = await prepareCreatePool(raydium, { mintInfo, tokenRaw, solRaw, legacy });
     if (prepared.poolId) {
-      const existing = await connection.getAccountInfo(new (await import("@solana/web3.js")).PublicKey(prepared.poolId), "confirmed");
+      const existing = await connection.getAccountInfo(new PublicKey(prepared.poolId), "confirmed");
       if (existing) {
         throw new StageError("prepare", existing.owner.toBase58() === prepared.programId
           ? "A pool already exists for this token pair. BALNEX stopped to prevent duplicate pool initialization."
@@ -351,7 +351,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
         const pending = pendingCreation.current;
         const status = await connection.getSignatureStatuses([pending.signature], { searchTransactionHistory: true });
         const state = status.value[0];
-        const poolAccount = await connection.getAccountInfo(new (await import("@solana/web3.js")).PublicKey(pending.poolId), "confirmed");
+        const poolAccount = await connection.getAccountInfo(new PublicKey(pending.poolId), "confirmed");
         if (poolAccount) {
           throw new StageError("verification", "A pool account now exists for the previous creation attempt. Refresh pool records and verify it before starting another creation.", {
             submitted: true,
