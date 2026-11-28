@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
+import { getMint, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { useConnectSheet } from "../components/WalletSheet";
 import { PublicKey, SystemProgram, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
 import { useToast } from "../components/Toast";
@@ -751,10 +752,58 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
             const account = lifecycleLock.poolId ? await connection.getAccountInfo(new PublicKey(lifecycleLock.poolId), "confirmed") : null;
             setLifecycleVerification({ signature, status: status.value[0] || null, poolAccountExists: Boolean(account), checked: true });
             if (status.value[0]?.err) {
-              markOperationOutcome("failed_submitted", { signature, reason: "Recorded transaction failed on-chain." });
-              notify("The recorded transaction failed on-chain. The token remains locked while BALNEX checks the current pool state.", "info");
+              if (lifecycleLock.operation?.type === "pool_create" && account) {
+                markOperationOutcome("unknown", { signature, reason: "Creation signature failed, but a pool account exists at the derived address. Verify its CPMM identity and reserves." });
+              } else if (lifecycleLock.operation?.type === "token_create" && await connection.getAccountInfo(new PublicKey(lifecycleLock.mint), "confirmed")) {
+                markOperationOutcome("unknown", { signature, reason: "Token creation signature failed, but the reserved mint account exists. Verify the mint before retrying." });
+              } else {
+                markOperationOutcome("failed_submitted", { signature, reason: "Recorded transaction failed on-chain and the expected account was not created." });
+              }
+              notify("The recorded transaction failed on-chain. BALNEX checked the expected account and retained the lock where state was ambiguous.", "info");
             } else if (status.value[0]?.confirmationStatus === "finalized") {
-              notify("Signature is finalized. BALNEX still requires independent mint/pool/LP verification before changing the lifecycle state.", "info");
+              if (lifecycleLock.operation?.type === "token_create") {
+                const mint = new PublicKey(lifecycleLock.mint);
+                const info = await connection.getAccountInfo(mint, "confirmed");
+                if (!info || !info.owner.equals(TOKEN_PROGRAM_ID)) throw new Error("The reserved mint account is missing or is not owned by the SPL Token program.");
+                const parsedMint = await getMint(connection, mint, "confirmed", TOKEN_PROGRAM_ID);
+                if (parsedMint.decimals !== Number(lifecycleLock.decimals)) throw new Error("The finalized mint decimals do not match the reserved token configuration.");
+                markTokenCreated({
+                  wallet: lifecycleLock.wallet, mint: lifecycleLock.mint, name: lifecycleLock.name,
+                  symbol: lifecycleLock.symbol, decimals: parsedMint.decimals, supply: lifecycleLock.supply, signature,
+                });
+                notify("Token creation verified on-chain. Continue to its liquidity workflow.", "success");
+              } else if (lifecycleLock.operation?.type === "pool_create" && account && publicKey?.toBase58() === lifecycleLock.wallet) {
+                const record = loadPoolRecords().find((item) => item.mint === lifecycleLock.mint && item.poolId === lifecycleLock.poolId) || {
+                  poolId: lifecycleLock.poolId, owner: lifecycleLock.wallet, cluster: CLUSTER,
+                  mint: lifecycleLock.mint, name: lifecycleLock.name, symbol: lifecycleLock.symbol, signature,
+                };
+                const verifiedPool = await verifyOne(record);
+                if (verifiedPool.status !== "verified") throw new Error(verifiedPool.message || "The finalized pool could not be independently verified.");
+                savePoolRecord({ ...record, signature, lpMint: verifiedPool.lpMint });
+                markLiquidityCreated(lifecycleLock.wallet, lifecycleLock.mint, { poolId: lifecycleLock.poolId, creationSignature: signature, lpMint: verifiedPool.lpMint });
+                setRecordsVersion((v) => v + 1);
+                notify("Pool creation and CPMM pool state verified on-chain.", "success");
+              } else if (lifecycleLock.operation?.type === "remove_liquidity" && account && publicKey?.toBase58() === lifecycleLock.wallet) {
+                const record = loadPoolRecords().find((item) => item.mint === lifecycleLock.mint && item.poolId === lifecycleLock.poolId);
+                if (!record) throw new Error("The pool record is missing; BALNEX cannot safely verify the withdrawal.");
+                const verifiedPool = await verifyOne(record);
+                if (verifiedPool.status === "error" || verifiedPool.status === "invalid") throw new Error(verifiedPool.message || "Pool verification failed.");
+                if (verifiedPool.status === "emptied" && verifiedPool.lpRaw === 0n &&
+                    Number(verifiedPool.reserves?.token) === 0 && Number(verifiedPool.reserves?.sol) === 0) {
+                  markOperationOutcome("confirmed", { signature });
+                  markLiquidityRemoved(lifecycleLock.wallet, lifecycleLock.mint, signature, {
+                    poolId: lifecycleLock.poolId, verified: true, signatureStatus: "finalized",
+                    remainingLpRaw: verifiedPool.lpRaw.toString(), poolStatus: verifiedPool.status, reserves: verifiedPool.reserves,
+                  });
+                  notify("Full liquidity removal verified. The lifecycle lock is resolved.", "success");
+                } else {
+                  markOperationOutcome("confirmed", { signature });
+                  markRemovalVerified({ signature, remainingLpRaw: verifiedPool.lpRaw.toString(), reserves: verifiedPool.reserves, poolStatus: verifiedPool.status });
+                  notify("Removal is finalized; some LP balance or pool liquidity remains, so the lifecycle stays locked.", "info");
+                }
+              } else {
+                notify("Signature is finalized, but BALNEX cannot verify the relevant on-chain state with the currently connected wallet.", "info");
+              }
             } else {
               notify("Transaction remains unconfirmed or unknown. The lock remains active.", "info");
             }
