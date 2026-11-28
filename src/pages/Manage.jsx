@@ -7,7 +7,8 @@ import Diagnostics from "../components/Diagnostics";
 import { useToast } from "../components/Toast";
 import { CLUSTER, WSOL_MINT } from "../config";
 import { TokenStats } from "../components/Analytics";
-import { useLaunches } from "../lib/launch";
+import { useLaunches, useLifecycleLock } from "../lib/launch";
+import SocialLinks from "../components/SocialLinks";
 import { loadPoolRecords } from "../lib/pools";
 import {
   AUTHORITIES,
@@ -42,6 +43,7 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
   //  - anything left is de-duplicated by mint.
   const owner = publicKey ? publicKey.toBase58() : "";
   const launches = useLaunches(owner);
+  const lifecycleLock = useLifecycleLock();
   const poolRecords = useMemo(
     () => (owner ? loadPoolRecords().filter((r) => r.owner === owner) : []),
     [owner, launches]
@@ -325,6 +327,12 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
           {loading ? "Loading…" : "Refresh"}
         </button>
       </div>
+
+      {lifecycleLock && (
+        <div className="notice">
+          <div><strong>LIQUIDITY WORKFLOW LOCKED</strong><p>{lifecycleLock.name} ({lifecycleLock.symbol}) is the only token permitted to continue its liquidity lifecycle.</p></div>
+        </div>
+      )}
 
       {error && (
         <div className="notice notice-error">
@@ -615,11 +623,13 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
                 );
               })()}
 
+              <SocialLinks mint={token.mint} />
+
               {token.historical && <p className="helper">This token is no longer held by this wallet. Kept here as launch history.</p>}
 
-              {!token.historical && !launches.some((l) => l.mint === token.mint && (l.poolId || l.status === "completed")) && (
+              {!token.historical && !launches.some((l) => l.mint === token.mint && (l.poolId || l.status === "completed")) && (!lifecycleLock || lifecycleLock.mint === token.mint) && (
               <div className="token-actions">
-                <button type="button" className="secondary-button compact" onClick={() => onUseForLiquidity(token.mint)}>
+                <button type="button" className="secondary-button compact" disabled={Boolean(lifecycleLock && lifecycleLock.mint !== token.mint)} onClick={() => onUseForLiquidity(token.mint)}>
                   Create pool →
                 </button>
               </div>
