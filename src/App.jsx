@@ -92,7 +92,6 @@ export default function App() {
   const walletTokens = useWalletTokens();
 
   // One unfinished launch per wallet (per network). See lib/launch.js.
-  const walletAddress = publicKey ? publicKey.toBase58() : "";
   const launch = useActiveLaunch();
   const lifecycleLock = useLifecycleLock();
   const creatingRef = useRef(false);
