@@ -720,7 +720,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
         </div>
       )}
 
-      {["unknown", "submitted"].includes(lifecycleLock?.operation?.state) && (
+      {lifecycleLock?.cluster === CLUSTER && ["unknown", "submitted"].includes(lifecycleLock?.operation?.state) && (
         <button type="button" className="secondary-button" disabled={busy} onClick={async () => {
           const signature = lifecycleLock.operation?.signature || lifecycleLock.recovery?.signature;
           try {
