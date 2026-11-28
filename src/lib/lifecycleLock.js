@@ -48,7 +48,31 @@ function persist(lock) {
 }
 
 export function getLifecycleLock() {
-  const lock = safeRead(KEY, null);
+  let lock = safeRead(KEY, null);
+  if (!lock) {
+    // One-time migration from the previous wallet-scoped launch store. Active records
+    // become the single global lock; completed/abandoned history never unlocks another lock.
+    const legacy = safeRead(`balnex:launches:v1:${CLUSTER}`, []);
+    const active = Array.isArray(legacy)
+      ? legacy.filter((item) => item && ["launch_pending", "liquidity_created"].includes(item.status))
+          .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0))[0]
+      : null;
+    if (active) {
+      const status = active.status === "liquidity_created" ? "POOL_RUNNING" : "TOKEN_CREATED";
+      lock = {
+        id: `migrated-${active.mint}`, cluster: CLUSTER, wallet: active.wallet,
+        mint: active.mint, name: active.name || "", symbol: active.symbol || "",
+        decimals: active.decimals ?? null, supply: active.supply ?? null,
+        status, poolId: active.poolId || null,
+        transactions: { tokenCreation: active.signature || null, poolCreation: active.creationSignature || null, addLiquidity: null, removeLiquidity: active.removalSignature || null },
+        operation: { type: "migration", state: "confirmed", updatedAt: Date.now() },
+        createdAt: active.createdAt || Date.now(), updatedAt: Date.now(),
+        transitions: [{ status, at: Date.now(), source: "legacy_migration" }],
+        recovery: null, lastVerification: null,
+      };
+      persist(lock);
+    }
+  }
   return lock && lock.id && lock.status && ACTIVE_STATES.has(lock.status) ? lock : null;
 }
 
@@ -83,6 +107,15 @@ export function reserveTokenLifecycle({ wallet, mint, name, symbol, decimals, su
   const check = getLifecycleLock();
   if (!check || check.id !== lock.id) throw new Error("Another tab reserved the BALNEX lifecycle first. Refresh before continuing.");
   return lock;
+}
+
+export function replaceReservedMint(mint, expectedName, expectedSymbol) {
+  const current = getLifecycleLock();
+  if (!current || current.status !== "TOKEN_RESERVED" || current.operation?.state !== "failed_no_submission" ||
+      current.transactions?.tokenCreation || current.name !== expectedName || current.symbol !== expectedSymbol) {
+    throw new Error("This reserved token cannot be replaced safely. Verify the existing lifecycle before retrying.");
+  }
+  return updateLifecycleLock({ mint, recovery: null, operation: { type: "token_create", state: "prepared", startedAt: Date.now(), updatedAt: Date.now() } }, current.id);
 }
 
 export function updateLifecycleLock(patch, expectedId) {
@@ -229,7 +262,7 @@ export function markLiquidityRemoved(wallet, mint, removalSignature, extra = {})
 // not scoped to the currently connected wallet.
 export function getActiveLaunch(wallet) {
   const lock = getLifecycleLock();
-  if (!lock || (wallet && lock.wallet && wallet !== lock.wallet)) return null;
+  if (!lock) return null;
   return { ...lock, status: LEGACY_STATUS(lock.status), lifecycleStatus: lock.status, signature: lock.transactions?.tokenCreation };
 }
 export function getLaunches(wallet) {
@@ -258,6 +291,20 @@ export function useLaunches(wallet) {
     };
   }, []);
   return useMemo(() => getLaunches(wallet), [wallet, version]);
+}
+
+export function useLifecycleLock() {
+  const [version, setVersion] = useState(0);
+  useEffect(() => {
+    const bump = () => setVersion((v) => v + 1);
+    window.addEventListener(EVENT, bump);
+    window.addEventListener("storage", bump);
+    return () => {
+      window.removeEventListener(EVENT, bump);
+      window.removeEventListener("storage", bump);
+    };
+  }, []);
+  return useMemo(() => getLifecycleLock(), [version]);
 }
 
 export function useActiveLaunch(wallet) {
