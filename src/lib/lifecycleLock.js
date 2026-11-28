@@ -245,6 +245,11 @@ export function markRemovalVerified(details = {}) {
 export function markOperationPending(type, pendingStatus, details = {}) {
   const current = getLifecycleLock();
   if (!current) throw new Error("No active lifecycle lock.");
+  const allowed = type === "pool_create" ? ["TOKEN_CREATED", "POOL_PENDING", "RECOVERY_REQUIRED"]
+    : type === "add_liquidity" ? ["POOL_RUNNING", "ADD_LIQUIDITY_PENDING", "RECOVERY_REQUIRED"]
+      : type === "remove_liquidity" ? ["POOL_RUNNING", "REMOVAL_PENDING", "RECOVERY_REQUIRED"] : [];
+  if (!allowed.includes(current.status)) throw new Error(`Operation ${type} is not allowed while lifecycle is ${current.status}.`);
+  if (current.operation?.state === "submitted" || current.operation?.state === "unknown") throw new Error("A previous transaction remains unresolved. Verify its status before retrying.");
   return transitionLifecycle(pendingStatus, {
     operation: { type, state: "prepared", updatedAt: Date.now(), ...details },
   });
@@ -261,15 +266,17 @@ export function markOperationOutcome(state, details = {}) {
   if (signatureKey && details.signature) transactions[signatureKey] = details.signature;
   const unknown = ["submitted", "unknown", "failed_submitted"].includes(state);
   const nextStatus = unknown ? "RECOVERY_REQUIRED"
-    : state === "confirmed" && current.operation?.type === "pool_create" ? "POOL_RUNNING"
-      : state === "confirmed" && current.operation?.type === "add_liquidity" ? "POOL_RUNNING"
-        : state === "confirmed" && current.operation?.type === "remove_liquidity" ? "REMOVAL_PENDING"
-          : current.status;
+    : state === "failed_no_submission" && current.operation?.type === "pool_create" ? "TOKEN_CREATED"
+      : state === "failed_no_submission" && current.operation?.type === "remove_liquidity" ? "POOL_RUNNING"
+        : state === "confirmed" && current.operation?.type === "pool_create" ? "POOL_RUNNING"
+          : state === "confirmed" && current.operation?.type === "add_liquidity" ? "POOL_RUNNING"
+            : state === "confirmed" && current.operation?.type === "remove_liquidity" ? "REMOVAL_PENDING"
+              : current.status;
   return updateLifecycleLock({
     transactions,
     status: nextStatus,
     operation: { ...(current.operation || {}), state, updatedAt: now, ...details },
-    ...(unknown ? { recovery: { reason: details.reason || state, at: now, signature: details.signature || current.operation?.signature || null } } : {}),
+    ...(unknown ? { recovery: { reason: details.reason || state, at: now, signature: details.signature || current.operation?.signature || null } } : state === "failed_no_submission" ? { recovery: { reason: details.reason || state, at: now, signature: null } } : { recovery: null }),
   }, current.id);
 }
 
