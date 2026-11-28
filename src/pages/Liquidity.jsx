@@ -15,7 +15,7 @@ import {
   StageError,
   describeError,
   inspectTransaction,
-  rebuildWithoutLookupTables,
+  refreshTransactionBlockhash,
   signSendConfirm,
   simulateWithCost,
   toFailure,
@@ -66,6 +66,8 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   const [managing, setManaging] = useState("");
   const [showCreate, setShowCreate] = useState(false);
   const verifyRun = useRef(0);
+  const operationLock = useRef(false);
+  const pendingCreation = useRef(null);
   const launch = useActiveLaunch(owner);
 
   // Lifecycle sync from CHAIN-verified pool data. Creating a pool moves the launch to
@@ -224,12 +226,25 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
 
     const raydium = await getRaydium();
     const prepared = await prepareCreatePool(raydium, { mintInfo, tokenRaw, solRaw, legacy });
+    if (prepared.poolId) {
+      const existing = await connection.getAccountInfo(new (await import("@solana/web3.js")).PublicKey(prepared.poolId), "confirmed");
+      if (existing) {
+        throw new StageError("prepare", existing.owner.toBase58() === prepared.programId
+          ? "A pool already exists for this token pair. BALNEX stopped to prevent duplicate pool initialization."
+          : "The derived pool address is already occupied by an unexpected account. Creation was stopped for safety.", {
+          submitted: false,
+          inspection: { poolId: prepared.poolId, existingAccountOwner: existing.owner.toBase58(), expectedProgramId: prepared.programId },
+        });
+      }
+    }
     const tx = prepared.built.transaction;
     if (!tx) {
       throw new StageError("prepare", "The Raydium SDK didn't return a transaction to sign.", { submitted: false });
     }
 
-    const inspection = await inspectTransaction(connection, tx, publicKey, prepared.programId);
+    const refreshed = await refreshTransactionBlockhash(connection, tx, publicKey);
+    const activeTx = refreshed.transaction;
+    const inspection = await inspectTransaction(connection, activeTx, publicKey, prepared.programId);
     if (inspection.problems.length) {
       throw new StageError("prepare", `Transaction check failed: ${inspection.problems.join(" ")}`, {
         submitted: false,
@@ -239,14 +254,14 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
 
     let sim;
     try {
-      sim = await simulateWithCost(connection, tx, publicKey);
+      sim = await simulateWithCost(connection, activeTx, publicKey);
     } catch (err) {
       if (err instanceof StageError) err.details = { ...err.details, inspection };
       throw err;
     }
     let networkFee = 5000;
     try {
-      const fee = await connection.getFeeForMessage(tx.message, "confirmed");
+      const fee = await connection.getFeeForMessage(activeTx.message, "confirmed");
       if (typeof fee?.value === "number") networkFee = fee.value;
     } catch {
       // keep the default estimate
@@ -263,8 +278,10 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
       builtAt: Date.now(),
       legacy,
       inspection,
-      prepared,
+      prepared: { ...prepared, transaction: activeTx },
       mintInfo,
+      blockhash: refreshed.blockhash,
+      lastValidBlockHeight: refreshed.lastValidBlockHeight,
       tokenRaw,
       solRaw,
       cost: { deposit, poolFee, rent, networkFee, total, balance },
@@ -273,14 +290,18 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   }
 
   async function handleReviewPool() {
+    if (operationLock.current) return;
+    operationLock.current = true;
     clearFailure();
     setPlan(null);
 
     if (!connected || !publicKey) {
+      operationLock.current = false;
       openConnect();
       return;
     }
     if (!selected) {
+      operationLock.current = false;
       setError("Choose a token from your wallet first.");
       return;
     }
@@ -295,12 +316,14 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
     } finally {
       setBusy(false);
       setStage("");
+      operationLock.current = false;
     }
   }
 
   // Step 2: user confirmed the cost. Sign, send, confirm, verify.
   async function handleConfirmPool() {
-    if (!plan) return;
+    if (!plan || operationLock.current) return;
+    operationLock.current = true;
     clearFailure();
     setBusy(true);
 
@@ -323,60 +346,67 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
         throw new StageError("prepare", `You need about ${sol(short)} more SOL to cover this pool.`, { submitted: false });
       }
 
-      const labels = {
-        signing: "Waiting for your wallet to sign…",
-        submitting: "Sending to Solana Devnet…",
-        confirming: "Waiting for confirmation…",
-      };
-      labels["signing-alt"] = "Retrying with Phantom's sign-and-send…";
-      const run = (transaction, inspection, transactionFormat, notes) =>
-        signSendConfirm({
-          connection,
-          transaction,
-          signTransaction,
-          sendTransaction,
-          context: { inspection, transactionFormat, fallbackNotes: notes },
-          onStage: (name) => setStage(labels[name] || ""),
-        });
-
-      let signature;
-      try {
-        ({ signature } = await run(active.prepared.built.transaction, active.inspection, "v0 + lookup table"));
-      } catch (err) {
-        // Nothing was sent when signing fails, so re-formatting the same instructions is safe.
-        if (!(err instanceof StageError && err.stage === "signing" && err.details?.phantomInternal)) throw err;
-        console.warn("[BALNEX] v0 signing failed with -32603; retrying without lookup tables", describeError(err));
-        setStage("Re-formatting without lookup tables…");
-
-        let legacyTx;
-        let legacyInspection;
-        try {
-          legacyTx = await rebuildWithoutLookupTables(connection, active.prepared.built.transaction, publicKey);
-          legacyInspection = await inspectTransaction(connection, legacyTx, publicKey, active.prepared.programId);
-          if (legacyInspection.problems.length) throw new Error(legacyInspection.problems.join(" "));
-          if (legacyInspection.instructions.length !== active.inspection.instructions.length) {
-            throw new Error("Re-formatted transaction doesn't match the original instructions.");
-          }
-          await simulateWithCost(connection, legacyTx, publicKey);
-        } catch (fallbackErr) {
-          console.warn("[BALNEX] legacy re-format not possible:", fallbackErr);
-          err.details = {
-            ...err.details,
-            fallbackNotes: `Legacy re-format not possible: ${fallbackErr?.message || fallbackErr}`,
-            legacyInspection,
-          };
-          throw err;
+      // A previous submitted transaction must be resolved before any new creation.
+      if (pendingCreation.current) {
+        const pending = pendingCreation.current;
+        const status = await connection.getSignatureStatuses([pending.signature], { searchTransactionHistory: true });
+        const state = status.value[0];
+        const poolAccount = await connection.getAccountInfo(new (await import("@solana/web3.js")).PublicKey(pending.poolId), "confirmed");
+        if (poolAccount) {
+          throw new StageError("verification", "A pool account now exists for the previous creation attempt. Refresh pool records and verify it before starting another creation.", {
+            submitted: true,
+            signature: pending.signature,
+            inspection: { poolId: pending.poolId, accountOwner: poolAccount.owner.toBase58() },
+          });
         }
-
-        try {
-          ({ signature } = await run(legacyTx, legacyInspection, "legacy (no lookup table)", "Retried after v0 -32603"));
-        } catch (legacyErr) {
-          if (legacyErr instanceof StageError) {
-            legacyErr.details = { ...legacyErr.details, v0Attempts: err.details?.attempts, v0Inspection: active.inspection };
-          }
-          throw legacyErr;
+        if (!state || state.confirmationStatus !== "finalized") {
+          throw new StageError("confirmation", "The previous creation transaction is not conclusively finalized. BALNEX has blocked another attempt to avoid a duplicate pool.", {
+            submitted: true,
+            signature: pending.signature,
+            landed: state?.err ? "failed" : "unknown",
+            status: state,
+          });
         }
+        if (!state.err) {
+          throw new StageError("verification", "The previous creation transaction finalized, but the expected pool account is not yet verified. Do not retry until this is investigated.", {
+            submitted: true,
+            signature: pending.signature,
+            landed: "confirmed",
+          });
+        }
+        pendingCreation.current = null;
       }
+
+      const activeTx = active.prepared.transaction;
+      const freshInspection = await inspectTransaction(connection, activeTx, publicKey, active.prepared.programId);
+      if (freshInspection.problems.length) {
+        throw new StageError("prepare", `Transaction check failed: ${freshInspection.problems.join(" ")}`, {
+          submitted: false,
+          inspection: freshInspection,
+        });
+      }
+      const finalSimulation = await simulateWithCost(connection, activeTx, publicKey);
+      const blockhashValid = await connection.isBlockhashValid(active.blockhash, { commitment: "confirmed" });
+      if (!blockhashValid.value) {
+        throw new StageError("prepare", "The creation transaction expired before signing. Review the rebuilt transaction and confirm again.", { submitted: false });
+      }
+
+      const { signature } = await signSendConfirm({
+        connection,
+        transaction: activeTx,
+        signTransaction,
+        sendTransaction,
+        context: {
+          inspection: freshInspection,
+          transactionFormat: freshInspection.version === "legacy" ? "legacy" : `versioned (${freshInspection.version})`,
+          simulation: { unitsConsumed: finalSimulation.unitsConsumed, outflow: finalSimulation.outflow },
+          pool: { poolId: active.prepared.poolId, lpMint: active.prepared.lpMint, mint: selected.mint },
+        },
+        onSubmitted: (submittedSignature) => {
+          pendingCreation.current = { signature: submittedSignature, poolId: active.prepared.poolId };
+        },
+        onStage: (name) => setStage(({ signing: "Waiting for your wallet to sign…", submitting: "Sending to Solana Devnet…", confirming: "Waiting for confirmation…" })[name] || ""),
+      });
 
       setStage("Verifying the pool on-chain…");
       await verifyPoolAccount(connection, active.prepared.poolId, active.prepared.programId, signature);
@@ -415,6 +445,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
     } finally {
       setBusy(false);
       setStage("");
+      operationLock.current = false;
     }
   }
 
