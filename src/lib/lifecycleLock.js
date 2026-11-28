@@ -76,7 +76,7 @@ export function getLifecycleLock() {
   return lock && lock.id && lock.status && ACTIVE_STATES.has(lock.status) ? lock : null;
 }
 
-export function reserveTokenLifecycle({ wallet, mint, name, symbol, decimals, supply }) {
+export function reserveTokenLifecycle({ wallet, mint, name, symbol, decimals, supply, creationOptions = {} }) {
   if (operationInFlight) throw new Error("Another BALNEX lifecycle operation is already running.");
   const existing = getLifecycleLock();
   if (existing) {
@@ -92,6 +92,7 @@ export function reserveTokenLifecycle({ wallet, mint, name, symbol, decimals, su
     symbol,
     decimals: Number(decimals),
     supply: String(supply),
+    creationOptions,
     status: "TOKEN_RESERVED",
     operation: { type: "token_create", state: "prepared", startedAt: now, updatedAt: now },
     transactions: { tokenCreation: null, poolCreation: null, addLiquidity: null, removeLiquidity: null },
