@@ -91,7 +91,7 @@ export default function App() {
   const notify = useToast();
   const walletTokens = useWalletTokens();
 
-  // One unfinished launch per wallet (per network). See lib/launch.js.
+  // One application-wide lifecycle lock per network. See lib/lifecycleLock.js.
   const launch = useActiveLaunch();
   const lifecycleLock = useLifecycleLock();
   const creatingRef = useRef(false);
@@ -130,6 +130,22 @@ export default function App() {
   const [createdToken, setCreatedToken] = useState(null);
 
   const [faqOpen, setFaqOpen] = useState(null);
+
+  // Restore the exact token form choices for a reservation whose wallet signing
+  // definitively failed before submission. A new mint keypair is generated on retry.
+  useEffect(() => {
+    if (!lifecycleLock || lifecycleLock.status !== "TOKEN_RESERVED") return;
+    setName(lifecycleLock.name || "");
+    setSymbol(lifecycleLock.symbol || "");
+    setSupply(lifecycleLock.supply || "1000000000");
+    if (lifecycleLock.decimals !== null && lifecycleLock.decimals !== undefined) setDecimals(String(lifecycleLock.decimals));
+    if (lifecycleLock.creationOptions) {
+      setMintAuthority(lifecycleLock.creationOptions.mintAuthority || "revoke");
+      setFreezeAuthority(lifecycleLock.creationOptions.freezeAuthority || "revoke");
+      setUpdateAuthority(lifecycleLock.creationOptions.updateAuthority || "retain");
+      setDescription(lifecycleLock.creationOptions.description || "");
+    }
+  }, [lifecycleLock?.id, lifecycleLock?.status]);
 
   // Close the menu with Escape and stop the page scrolling behind it.
   useEffect(() => {
@@ -269,6 +285,7 @@ export default function App() {
           symbol,
           decimals: Number(decimals),
           supply,
+          creationOptions: { mintAuthority, freezeAuthority, updateAuthority, description },
         });
       }
       lifecycleOperation = beginLifecycleOperation({
@@ -605,7 +622,10 @@ export default function App() {
             <span>Status: {lifecycleLock.status.replaceAll("_", " ")}</span>
             <small>You must complete or resolve this token's liquidity lifecycle before creating another token.</small>
           </div>
-          <button type="button" className="primary" onClick={() => openLiquidity(lifecycleLock.mint)}>RESUME CURRENT TOKEN</button>
+          <button type="button" className="primary" onClick={() => {
+            if (lifecycleLock.status === "TOKEN_RESERVED") navigate("create");
+            else openLiquidity(lifecycleLock.mint);
+          }}>{lifecycleLock.status === "TOKEN_RESERVED" ? "RESUME TOKEN CREATION" : "RESUME CURRENT TOKEN"}</button>
         </section>
       )}
 
@@ -638,7 +658,11 @@ export default function App() {
         {/* CREATE TOKEN */}
         {page === "create" && launch && (
           <section className="panel">
-            <LaunchCard launch={launch} onContinue={() => openLiquidity(launch.mint)} />
+            <LaunchCard launch={launch} onContinue={() => {
+              if (lifecycleLock?.status === "TOKEN_RESERVED" && lifecycleLock.operation?.state === "failed_no_submission") createToken();
+              else if (lifecycleLock?.status === "TOKEN_RESERVED") notify("Token creation is reserved. Verify the prior operation before retrying.", "info");
+              else openLiquidity(launch.mint);
+            }} />
           </section>
         )}
 
