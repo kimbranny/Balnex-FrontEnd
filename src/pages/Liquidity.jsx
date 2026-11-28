@@ -74,7 +74,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   // liquidity_created but keeps the wallet locked; a pool that is verifiably drained on-chain
   // completes it. (BALNEX's own removal flow completes it too: see handleWithdrawn.)
   useEffect(() => {
-    if (!launch) return;
+    if (!launch || lifecycleLock?.cluster !== CLUSTER) return;
     const rec = records.find((r) => r.mint === launch.mint);
     const v = rec ? verifiedMap[rec.poolId] : null;
     if (!rec || !v) return;
