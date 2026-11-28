@@ -47,8 +47,37 @@ function persist(lock) {
   emit();
 }
 
+function corruptedLock(reason) {
+  return {
+    id: "storage-recovery-required",
+    cluster: CLUSTER,
+    wallet: null,
+    mint: "",
+    name: "Unknown token",
+    symbol: "",
+    status: "RECOVERY_REQUIRED",
+    operation: { type: "storage", state: "unknown", updatedAt: Date.now() },
+    transactions: {},
+    poolId: null,
+    recovery: { reason, at: Date.now(), signature: null },
+    lastVerification: null,
+  };
+}
+
 export function getLifecycleLock() {
-  let lock = safeRead(KEY, null);
+  let lock = null;
+  try {
+    const raw = localStorage.getItem(KEY);
+    if (raw) {
+      try { lock = JSON.parse(raw); }
+      catch { return corruptedLock("The saved lifecycle lock is unreadable. BALNEX blocked new token creation to avoid losing the active reservation."); }
+      if (!lock || typeof lock !== "object" || !lock.id || !ACTIVE_STATES.has(lock.status)) {
+        return corruptedLock("The saved lifecycle lock is incomplete or has an unknown status. Manual on-chain recovery is required.");
+      }
+    }
+  } catch {
+    return corruptedLock("Browser storage is unavailable. BALNEX cannot safely determine whether another token lifecycle is active.");
+  }
   if (!lock) {
     // One-time migration from the previous wallet-scoped launch store. Active records
     // become the single global lock; completed/abandoned history never unlocks another lock.
