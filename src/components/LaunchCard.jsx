@@ -16,7 +16,7 @@ export default function LaunchCard({ launch, onContinue }) {
           <small className="helper">Complete or resolve this token's liquidity lifecycle before creating another token.</small>
         </div>
         <div className="badges">
-          <span className="badge">{CLUSTER === "devnet" ? "Devnet" : "Mainnet"}</span>
+          <span className="badge">{String(launch.cluster || CLUSTER).toUpperCase()}</span>
           <span className={recovery ? "badge badge-warn" : lifecycle === "POOL_RUNNING" ? "badge badge-ok" : "badge badge-warn"}>
             {lifecycle.replaceAll("_", " ")}
           </span>
