@@ -592,6 +592,10 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
           simulation: { unitsConsumed: finalSimulation.unitsConsumed, outflow: finalSimulation.outflow },
           pool: { poolId: active.prepared.poolId, lpMint: active.prepared.lpMint, mint: selected.mint },
         },
+        onSigned: (signedSignature) => lifecycleOp.update("signed", {
+          signature: signedSignature, poolId: active.prepared.poolId,
+          blockhash: active.blockhash, lastValidBlockHeight: active.lastValidBlockHeight,
+        }),
         onSubmitted: (submittedSignature) => {
           submitted = submittedSignature;
           pendingCreation.current = { signature: submittedSignature, poolId: active.prepared.poolId };
