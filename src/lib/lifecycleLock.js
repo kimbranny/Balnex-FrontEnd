@@ -230,6 +230,18 @@ export function markLiquidityCreated(wallet, mint, details = {}) {
   });
 }
 
+export function markRemovalVerified(details = {}) {
+  const current = getLifecycleLock();
+  if (!current || !["REMOVAL_PENDING", "RECOVERY_REQUIRED"].includes(current.status)) {
+    throw new Error("No removal operation is awaiting verification.");
+  }
+  return transitionLifecycle("POOL_RUNNING", {
+    operation: { type: "remove_liquidity", state: "confirmed", updatedAt: Date.now(), signature: details.signature || null },
+    transactions: { ...current.transactions, ...(details.signature ? { removeLiquidity: details.signature } : {}) },
+    lastVerification: { ...details, checkedAt: Date.now() },
+  });
+}
+
 export function markRemovalPending(details = {}) {
   return transitionLifecycle("REMOVAL_PENDING", {
     operation: { type: "remove_liquidity", state: "prepared", updatedAt: Date.now() },
@@ -240,8 +252,14 @@ export function markRemovalPending(details = {}) {
 export function markLiquidityRemoved(wallet, mint, removalSignature, extra = {}) {
   const current = getLifecycleLock();
   if (!current || current.mint !== mint) throw new Error("Removal verification does not match the globally reserved token.");
-  if (!removalSignature && extra.verified !== true) {
-    throw new Error("A verified on-chain liquidity removal is required before releasing the global lock.");
+  if (
+    !removalSignature ||
+    extra.verified !== true ||
+    extra.signatureStatus !== "finalized" ||
+    String(extra.remainingLpRaw) !== "0" ||
+    current.operation?.state !== "confirmed"
+  ) {
+    throw new Error("A finalized removal signature and independently verified zero LP balance are required before releasing the global lock.");
   }
   const now = Date.now();
   const history = safeRead(HISTORY_KEY, []);
