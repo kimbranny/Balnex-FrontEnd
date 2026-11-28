@@ -122,6 +122,12 @@ export async function verifyPool({ connection, getRaydium, record, owner }) {
       lpDecimals: poolInfo.lpMint.decimals,
       lpRaw,
       lpSupply: BigInt(supply.value.amount),
+      lpTokenAccounts: accounts.value.map(({ pubkey, account }) => ({
+        address: pubkey.toBase58(),
+        tokenProgramId: account.owner.toBase58(),
+        rawAmount: account.data.parsed.info.tokenAmount.amount,
+        decimals: account.data.parsed.info.tokenAmount.decimals,
+      })),
       reserves,
       tokenSymbol: (solIsA ? poolInfo.mintB : poolInfo.mintA).symbol || "",
       checkedAt: Date.now(),

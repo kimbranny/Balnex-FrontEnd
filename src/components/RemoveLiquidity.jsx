@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { prepareRemoveLiquidity } from "../lib/raydium";
-import { signSendConfirm, simulateWithCost, toFailure } from "../lib/txRunner";
+import { verifyPool } from "../lib/pools";
+import { inspectTransaction, refreshTransactionBlockhash, signSendConfirm, simulateWithCost, toFailure } from "../lib/txRunner";
 import { explorerTx, fromRawUnits, shorten } from "../lib/utils";
 import Diagnostics from "./Diagnostics";
 
@@ -27,6 +28,7 @@ export default function RemoveLiquidity({
   const [stage, setStage] = useState("");
   const [failure, setFailure] = useState(null);
   const [done, setDone] = useState(null);
+  const inFlight = useRef(false);
 
   const lpRaw = verified.lpRaw;
   const hasLp = lpRaw > 0n;
@@ -37,48 +39,109 @@ export default function RemoveLiquidity({
   const symbol = verified.tokenSymbol || record.symbol || "tokens";
 
   async function handleWithdraw() {
-    if (burn <= 0n) return;
+    if (inFlight.current || burn <= 0n) return;
+    inFlight.current = true;
+    const selectedPercent = percent;
     setFailure(null);
     setDone(null);
     setBusy(true);
     try {
-      setStage("Building the withdrawal…");
+      setStage("Refreshing pool and LP position…");
       const raydium = await getRaydium();
+      const current = await verifyPool({
+        connection,
+        owner: publicKey,
+        record,
+        getRaydium: async () => raydium,
+      });
+      if (current.status !== "verified" || current.lpRaw <= 0n) {
+        throw new Error(current.message || "The pool or your LP position could not be verified. Refresh and try again.");
+      }
+      const freshBurn = (current.lpRaw * BigInt(selectedPercent)) / 100n;
+      if (freshBurn <= 0n || freshBurn > current.lpRaw) {
+        throw new Error("The selected withdrawal amount is no longer valid for your current LP balance.");
+      }
+
+      setStage("Building the withdrawal…");
       const built = await prepareRemoveLiquidity(raydium, {
-        poolInfo: verified.poolInfo,
-        poolKeys: verified.poolKeys,
-        lpRaw: burn,
+        poolInfo: current.poolInfo,
+        poolKeys: current.poolKeys,
+        lpRaw: freshBurn,
         slippagePercent: slippage,
       });
       const tx = built.transaction;
       if (!tx) throw new Error("The Raydium SDK didn't return a transaction to sign.");
 
-      setStage("Simulating…");
-      await simulateWithCost(connection, tx, publicKey);
+      // Refresh the actual transaction, not only the simulation copy. Then inspect and
+      // simulate that same message before asking Phantom to sign it.
+      const refreshed = await refreshTransactionBlockhash(connection, tx, publicKey);
+      const inspection = await inspectTransaction(connection, refreshed.transaction, publicKey);
+      if (inspection.problems.length) {
+        throw new Error(`Withdrawal transaction validation failed: ${inspection.problems.join(" ")}`);
+      }
 
-      const labels = {
-        signing: "Waiting for Phantom approval…",
-        "signing-alt": "Retrying with Phantom's sign-and-send…",
-        submitting: "Sending…",
-        confirming: "Waiting for confirmation…",
-      };
+      setStage("Simulating withdrawal…");
+      const simulation = await simulateWithCost(connection, refreshed.transaction, publicKey);
+      const blockhashCheck = await connection.isBlockhashValid(refreshed.blockhash, { commitment: "confirmed" });
+      if (!blockhashCheck.value) {
+        throw new Error("The withdrawal transaction blockhash expired during simulation. Please retry to rebuild it.");
+      }
+
       const { signature } = await signSendConfirm({
         connection,
-        transaction: tx,
+        transaction: refreshed.transaction,
         signTransaction,
         sendTransaction,
-        onStage: (name) => setStage(labels[name] || ""),
+        context: {
+          inspection,
+          transactionFormat: inspection.version === "legacy" ? "legacy" : `versioned (${inspection.version})`,
+          simulation: { unitsConsumed: simulation.unitsConsumed, outflow: simulation.outflow },
+          withdrawal: {
+            poolId: record.poolId,
+            lpMint: current.lpMint,
+            lpTokenAccounts: current.lpTokenAccounts,
+            lpTokenBalance: current.lpRaw.toString(),
+            poolMints: [current.poolInfo.mintA.address, current.poolInfo.mintB.address],
+            poolReserves: current.reserves,
+            requestedLpAmount: freshBurn.toString(),
+            percent: selectedPercent,
+            slippagePercent: slippage,
+            reserves: current.reserves,
+            lpDecimals: current.lpDecimals,
+          },
+        },
+        onStage: (name) => setStage(({ signing: "Waiting for Phantom approval…", submitting: "Sending…", confirming: "Waiting for confirmation…" })[name] || ""),
       });
 
-      setDone({ signature, percent });
+      setStage("Verifying withdrawal on-chain…");
+      const after = await verifyPool({
+        connection,
+        owner: publicKey,
+        record,
+        getRaydium: async () => raydium,
+      });
+      if (after.status !== "verified" && after.status !== "emptied") {
+        throw new Error("The withdrawal confirmed, but BALNEX could not verify the updated pool and LP position. Check the transaction before retrying.");
+      }
+      if (after.lpRaw >= current.lpRaw) {
+        throw new Error("The transaction confirmed, but the wallet's LP balance did not decrease as expected. Check the transaction before retrying.");
+      }
+
+      setDone({ signature, percent: selectedPercent });
       setPercent("");
-      notify("Liquidity withdrawn.", "success");
+      notify("Liquidity withdrawn and verified on-chain.", "success");
       setStage("Refreshing your position…");
-      await onChanged(signature);
+      try {
+        await onChanged(signature);
+      } catch (refreshError) {
+        console.warn("[BALNEX] withdrawal verified, but the UI refresh failed:", refreshError);
+        notify("Withdrawal is verified on-chain, but the position display could not refresh. Reopen this pool to reload it.", "info");
+      }
     } catch (err) {
       setFailure(toFailure(err));
       notify("Withdrawal did not complete. See details below.", "error");
     } finally {
+      inFlight.current = false;
       setBusy(false);
       setStage("");
     }
