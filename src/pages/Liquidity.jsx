@@ -92,6 +92,76 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
     }
   }, [launch, records, verifiedMap]);
 
+  // Startup / reconnect recovery: never infer success from local UI state. Re-check
+  // the recorded mint and signatures on the configured cluster; RPC failure retains lock.
+  const recoveryRun = useRef(false);
+  useEffect(() => {
+    if (!lifecycleLock || !connection || recoveryRun.current) return;
+    recoveryRun.current = true;
+    let cancelled = false;
+    (async () => {
+      try {
+        const mintInfo = await connection.getAccountInfo(new PublicKey(lifecycleLock.mint), "confirmed");
+        const signatures = Object.values(lifecycleLock.transactions || {}).filter(Boolean);
+        const statuses = signatures.length
+          ? await connection.getSignatureStatuses(signatures, { searchTransactionHistory: true })
+          : { value: [] };
+        if (cancelled) return;
+        const signatureResults = signatures.map((signature, index) => ({
+          signature,
+          status: statuses.value[index] || null,
+        }));
+        if (signatureResults.some((item) => item.status?.err)) {
+          setLifecycleVerification({ mintExists: Boolean(mintInfo), signatures: signatureResults, outcome: "one_or_more_transactions_failed" });
+          markOperationOutcome("failed_submitted", {
+            signature: signatureResults.find((item) => item.status?.err)?.signature,
+            reason: "A recorded lifecycle transaction failed on-chain. Verify mint/pool state before retrying.",
+          });
+          return;
+        }
+        if (lifecycleLock.poolId) {
+          const poolAccount = await connection.getAccountInfo(new PublicKey(lifecycleLock.poolId), "confirmed");
+          if (!poolAccount) {
+            setLifecycleVerification({ mintExists: Boolean(mintInfo), signatures: signatureResults, poolExists: false, outcome: "pool_not_found" });
+            if (lifecycleLock.operation?.state === "submitted" || lifecycleLock.operation?.state === "unknown") {
+              markOperationOutcome("unknown", { reason: "Recorded pool creation has no verifiable pool account yet." });
+            }
+            return;
+          }
+          if (publicKey && lifecycleLock.wallet === publicKey.toBase58()) {
+            const record = loadPoolRecords().find((item) => item.mint === lifecycleLock.mint && item.poolId === lifecycleLock.poolId);
+            if (record) {
+              const result = await verifyOne(record);
+              if (cancelled) return;
+              setLifecycleVerification({ mintExists: Boolean(mintInfo), signatures: signatureResults, pool: { status: result.status, lpRaw: result.lpRaw?.toString() || null, reserves: result.reserves || null } });
+              if (result.status === "verified" && lifecycleLock.status !== "POOL_RUNNING") {
+                markLiquidityCreated(lifecycleLock.wallet, lifecycleLock.mint, {
+                  poolId: record.poolId, creationSignature: record.signature,
+                });
+              }
+              if (result.status === "error") markOperationOutcome("unknown", { reason: result.message || "Pool RPC verification unavailable." });
+            } else {
+              setLifecycleVerification({ mintExists: Boolean(mintInfo), signatures: signatureResults, poolExists: true, outcome: "pool_exists_record_missing" });
+            }
+          } else {
+            setLifecycleVerification({ mintExists: Boolean(mintInfo), signatures: signatureResults, poolExists: true, outcome: "wallet_reconnect_required" });
+          }
+        } else {
+          setLifecycleVerification({ mintExists: Boolean(mintInfo), signatures: signatureResults, outcome: mintInfo ? "mint_exists" : "mint_not_found" });
+          if (!mintInfo && lifecycleLock.operation?.state !== "failed_no_submission") {
+            markOperationOutcome("unknown", { reason: "The reserved mint account could not be found. The lifecycle remains locked pending transaction investigation." });
+          }
+        }
+      } catch (recoveryError) {
+        if (!cancelled) {
+          setLifecycleVerification({ outcome: "rpc_unavailable", message: recoveryError?.message || "RPC verification unavailable." });
+          markOperationOutcome("unknown", { reason: "RPC verification unavailable. The global lifecycle lock was retained." });
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [lifecycleLock?.id, connection, publicKey, verifyOne]);
+
   const usable = useMemo(
     () => walletTokens.tokens.filter((token) => token.raw > 0n && token.mint !== WSOL_MINT),
     [walletTokens.tokens]
