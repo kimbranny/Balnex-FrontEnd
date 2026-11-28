@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { CLUSTER } from "../config";
+import { CLUSTER } from "../config.js";
 
 const KEY = `balnex:lifecycle-lock:v1:${CLUSTER}`;
 const HISTORY_KEY = `balnex:lifecycle-history:v1:${CLUSTER}`;
