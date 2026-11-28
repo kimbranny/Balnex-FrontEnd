@@ -211,6 +211,7 @@ export function beginLifecycleOperation({ mint, type, allowedStates, pendingStat
           : state === "failed_no_submission" && type === "token_create" ? "TOKEN_RESERVED"
             : state === "failed_submitted" && type === "pool_create" ? "TOKEN_CREATED"
               : state === "failed_submitted" && type === "remove_liquidity" ? "POOL_RUNNING"
+              : state === "failed_submitted" && type === "token_create" ? "TOKEN_RESERVED"
                 : state === "confirmed" && type === "pool_create" ? "POOL_RUNNING"
                   : state === "confirmed" && type === "remove_liquidity" ? "REMOVAL_PENDING"
                     : latest.status;
