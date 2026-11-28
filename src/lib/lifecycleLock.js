@@ -174,13 +174,21 @@ export function beginLifecycleOperation({ mint, type, allowedStates, pendingStat
               : type === "remove_liquidity" ? "removeLiquidity" : null;
         if (key) transactions[key] = details.signature;
       }
+      const unknown = state === "unknown" || state === "submitted";
+      const nextStatus = unknown ? "RECOVERY_REQUIRED"
+        : state === "failed_no_submission" && type === "pool_create" ? "TOKEN_CREATED"
+          : state === "failed_no_submission" && type === "remove_liquidity" ? "POOL_RUNNING"
+            : state === "failed_submitted" && type === "pool_create" ? "TOKEN_CREATED"
+              : state === "failed_submitted" && type === "remove_liquidity" ? "POOL_RUNNING"
+                : state === "confirmed" && type === "pool_create" ? "POOL_RUNNING"
+                  : state === "confirmed" && type === "remove_liquidity" ? "REMOVAL_PENDING"
+                    : latest.status;
       updateLifecycleLock({
         transactions,
         poolId: details.poolId || latest.poolId,
+        status: nextStatus,
         operation: { ...(latest.operation || {}), type, state, updatedAt: now, ...details },
-        ...(state === "unknown" || state === "failed_submitted"
-          ? { status: "RECOVERY_REQUIRED", recovery: { reason: details.reason || state, at: now, signature: details.signature || null } }
-          : {}),
+        ...(unknown ? { recovery: { reason: details.reason || state, at: now, signature: details.signature || null } } : state === "failed_no_submission" ? { recovery: { reason: details.reason || state, at: now, signature: null } } : { recovery: null }),
       }, current.id);
     },
     release: () => {
