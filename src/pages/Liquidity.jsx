@@ -85,8 +85,10 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
         tokenDeposited: rec.tokenDeposited,
         solDeposited: rec.solDeposited,
       });
-    } else if (launch.status === "liquidity_created" && v.status === "emptied") {
-      markLiquidityRemoved(launch.wallet, launch.mint, null, { reason: "pool_emptied_on_chain" });
+    } else if (launch.status === "liquidity_created" && v.status === "emptied" && !getLifecycleLock()?.transactions?.removeLiquidity) {
+      markOperationOutcome("unknown", {
+        reason: "Pool reserves are empty, but BALNEX has no recorded finalized removal transaction. Manual recovery verification is required.",
+      });
     }
   }, [launch, records, verifiedMap]);
 
