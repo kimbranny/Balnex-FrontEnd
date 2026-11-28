@@ -3,7 +3,7 @@ import { prepareRemoveLiquidity } from "../lib/raydium";
 import { verifyPool } from "../lib/pools";
 import { inspectTransaction, refreshTransactionBlockhash, signSendConfirm, simulateWithCost, toFailure } from "../lib/txRunner";
 import { explorerTx, fromRawUnits, shorten } from "../lib/utils";
-import { beginLifecycleOperation, getLifecycleLock, markOperationOutcome } from "../lib/lifecycleLock";
+import { acquireCrossTabOperationLock, beginLifecycleOperation, getLifecycleLock, markOperationOutcome } from "../lib/lifecycleLock";
 import Diagnostics from "./Diagnostics";
 
 const SLIPPAGE_OPTIONS = [0.5, 1, 3];
@@ -44,11 +44,14 @@ export default function RemoveLiquidity({
     inFlight.current = true;
     const selectedPercent = percent;
     let lifecycleOp = null;
+    let crossTabOperation = null;
     let submittedSignature = null;
     setFailure(null);
     setDone(null);
     setBusy(true);
     try {
+      crossTabOperation = await acquireCrossTabOperationLock();
+      if (!crossTabOperation) throw new Error("Another BALNEX browser tab is performing a lifecycle operation. Wait for it to finish, then retry.");
       const currentLock = getLifecycleLock();
       if (!currentLock || currentLock.mint !== record.mint || currentLock.poolId && currentLock.poolId !== record.poolId) {
         throw new Error("Removal is blocked because this pool is not the token reserved by BALNEX's global lifecycle lock.");
@@ -187,6 +190,7 @@ export default function RemoveLiquidity({
       notify("Withdrawal did not complete. See details below.", "error");
     } finally {
       lifecycleOp?.release();
+      crossTabOperation?.release();
       inFlight.current = false;
       setBusy(false);
       setStage("");
