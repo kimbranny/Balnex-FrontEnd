@@ -3,7 +3,7 @@
 import { PublicKey } from "@solana/web3.js";
 import { TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { CLUSTER, WSOL_MINT } from "../config";
-import { aggregateHolders, parsePoolState, parseTokenAccountSlice } from "./analyticsCodec";
+import { aggregateHolders, parsePoolState, parseTokenAccountSlice, topHolders } from "./analyticsCodec";
 
 const b58 = (bytes) => new PublicKey(bytes).toBase58();
 
@@ -86,8 +86,12 @@ export async function fetchHolders(connection, mint) {
   // Owners that are off the ed25519 curve are program-derived (e.g. pool vault authorities).
   const summary = aggregateHolders(parsed, (owner) => !PublicKey.isOnCurve(new PublicKey(owner).toBytes()));
 
+  const isProgram = (owner) => !PublicKey.isOnCurve(new PublicKey(owner).toBytes());
+  const distribution = topHolders(parsed, isProgram, supply.value.amount, 10);
+
   return {
     ...summary,
+    ...distribution,
     supplyRaw: BigInt(supply.value.amount),
     decimals: supply.value.decimals,
     tokenProgram: programId.toBase58(),

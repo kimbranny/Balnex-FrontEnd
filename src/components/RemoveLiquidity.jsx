@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { prepareRemoveLiquidity } from "../lib/raydium";
 import { beginRemoveLiquidity, checkAllowed, OP } from "../lib/lifecycleLock";
-import { describeError, messageOf, signSendConfirm, simulateWithCost, toFailure } from "../lib/txRunner";
+import { lpForPercent, estimateOutputs, minOutput } from "../lib/liquidityMath";
+import { StageError, describeError, inspectTransaction, messageOf, signSendConfirm, simulateWithCost, toFailure } from "../lib/txRunner";
 import { useLifecycleLock, useVerifyLifecycle } from "../lib/useLifecycleLock";
 import { explorerTx, fromRawUnits, shorten } from "../lib/utils";
 import Diagnostics from "./Diagnostics";
@@ -29,16 +30,16 @@ export default function RemoveLiquidity({
   const [stage, setStage] = useState("");
   const [failure, setFailure] = useState(null);
   const [done, setDone] = useState(null);
+  // Wallet method is chosen by the user after a failure; it is never switched automatically.
+  const [method, setMethod] = useState("sign");
   useLifecycleLock(); // re-render when the lock changes
   const { verify: verifyLock } = useVerifyLifecycle();
   const gate = checkAllowed(OP.REMOVE_LIQUIDITY, record.mint);
 
   const lpRaw = verified.lpRaw;
   const hasLp = lpRaw > 0n;
-  const burn = percent ? (lpRaw * BigInt(percent)) / 100n : 0n;
-  const share = verified.lpSupply > 0n ? Number(burn) / Number(verified.lpSupply) : 0;
-  const estToken = verified.reserves.token * share;
-  const estSol = verified.reserves.sol * share;
+  const burn = percent ? lpForPercent(lpRaw, percent) : 0n;
+  const { token: estToken, sol: estSol } = estimateOutputs(verified.reserves, burn, verified.lpSupply);
   const symbol = verified.tokenSymbol || record.symbol || "tokens";
 
   async function handleWithdraw() {
@@ -67,8 +68,38 @@ export default function RemoveLiquidity({
       const tx = built.transaction;
       if (!tx) throw new Error("The Raydium SDK didn't return a transaction to sign.");
 
+      // Everything below is public data only (addresses, sizes, amounts); never keys.
+      setStage("Inspecting the transaction…");
+      const inspection = await inspectTransaction(connection, tx, publicKey, verified.poolInfo?.programId);
+      const diagnostics = {
+        pool: record.poolId,
+        cpmmProgram: verified.poolInfo?.programId || null,
+        lpMint: verified.lpMint,
+        lpBalanceRaw: String(lpRaw),
+        lpToBurnRaw: String(burn),
+        selectedPercent: percent,
+        slippagePercent: slippage,
+        estimatedTokenOut: estToken,
+        estimatedSolOut: estSol,
+        minTokenOut: minOutput(estToken, slippage),
+        minSolOut: minOutput(estSol, slippage),
+        walletIsLpOwner: publicKey.toBase58() === record.owner,
+        method,
+      };
+      if (publicKey.toBase58() !== record.owner) {
+        throw new StageError("prepare", "The connected wallet isn't the owner of this pool's LP tokens.", { submitted: false, inspection, extra: diagnostics });
+      }
+      if (inspection.problems.length) {
+        throw new StageError("prepare", `Transaction check failed: ${inspection.problems.join(" ")}`, { submitted: false, inspection, extra: diagnostics });
+      }
+
       setStage("Simulating…");
-      await simulateWithCost(connection, tx, publicKey);
+      try {
+        await simulateWithCost(connection, tx, publicKey);
+      } catch (simErr) {
+        if (simErr instanceof StageError) simErr.details = { ...simErr.details, inspection, extra: diagnostics };
+        throw simErr;
+      }
 
       const labels = {
         signing: "Waiting for Phantom approval…",
@@ -87,6 +118,8 @@ export default function RemoveLiquidity({
           setStage(labels[name] || "");
         },
         onSubmitted: (sig, blockhash) => op.submitted({ signature: sig, blockhash }),
+        method,
+        context: { inspection, transactionFormat: inspection.version, extra: diagnostics },
       });
       op.confirmed({ signature }); // transaction confirmed; the lock stays until verified on-chain
       confirmedOnChain = true;
@@ -99,6 +132,7 @@ export default function RemoveLiquidity({
     } catch (err) {
       setFailure(toFailure(err));
       notify("Withdrawal did not complete. See details below.", "error");
+      // Percentage stays selected so a user-requested retry rebuilds the same withdrawal fresh.
       if (!confirmedOnChain) {
         const d = describeError(err);
         op.failed({ submitted: d.submitted, signature: d.signature, message: d.message, stage: d.stage });
@@ -160,6 +194,20 @@ export default function RemoveLiquidity({
             <strong>{failure.info.title}</strong>
             <p>{failure.info.outcome}</p>
             <p>{failure.info.body}</p>
+            {failure.diag?.stage === "signing" && (
+              <>
+                <p>
+                  This is a wallet-signing failure, not a Raydium or on-chain failure. Check that Phantom is set to Solana
+                  Devnet (Settings → Developer Settings → Testnet Mode) and unlocked, then retry. Every retry rebuilds the
+                  withdrawal from fresh on-chain data and a fresh blockhash.
+                </p>
+                {failure.diag?.walletErrorCode === -32603 && method === "sign" && (
+                  <button type="button" className="text-button" disabled={busy} onClick={() => setMethod("signAndSend")}>
+                    Use Phantom's sign-and-send on my next attempt
+                  </button>
+                )}
+              </>
+            )}
             <Diagnostics data={failure.diag} />
           </div>
         </div>

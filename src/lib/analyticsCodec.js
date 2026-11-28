@@ -52,3 +52,29 @@ export function aggregateHolders(accounts, isProgramOwned) {
     tokenAccounts: accounts.length,
   };
 }
+
+// Top holders by OWNER (token accounts of the same wallet are summed). Program-controlled
+// owners (e.g. pool vault authorities) are excluded and reported separately. Percentages are of
+// TOTAL supply, so they include supply held by excluded accounts in the denominator.
+export function topHolders(accounts, isProgramOwned, supplyRaw, limit = 10) {
+  const byOwner = new Map();
+  let excludedRaw = 0n;
+  for (const { owner, amount } of accounts) {
+    if (amount <= 0n) continue;
+    if (isProgramOwned(owner)) {
+      excludedRaw += amount;
+      continue;
+    }
+    byOwner.set(owner, (byOwner.get(owner) || 0n) + amount);
+  }
+  const supply = BigInt(supplyRaw);
+  const list = [...byOwner.entries()]
+    .sort((a, b) => (b[1] > a[1] ? 1 : b[1] < a[1] ? -1 : 0))
+    .slice(0, limit)
+    .map(([owner, amount]) => ({
+      owner,
+      amount,
+      percent: supply > 0n ? Number((amount * 1000000n) / supply) / 10000 : null,
+    }));
+  return { top: list, programOwnedRaw: excludedRaw };
+}

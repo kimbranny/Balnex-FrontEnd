@@ -14,9 +14,9 @@ globalThis.localStorage = {
 export const storage = store;
 
 let n = 0;
-export async function loadSrc(file) {
+export async function loadSrc(file, prelude = "") {
   const src = fs.readFileSync(path.resolve("src", file), "utf8");
-  const code = src
+  const code = prelude + "\n" + src
     .replace(/import\s*\{[^}]*\}\s*from\s*"\.\.\/config";?/g, 'const CLUSTER = "devnet";')
     .replace(/^import .*$/gm, "");
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "balnex-test-"));

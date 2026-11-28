@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { useConnectSheet } from "../components/WalletSheet";
-import { SystemProgram, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
+import { PublicKey, SystemProgram, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
 import { useToast } from "../components/Toast";
 import { CLUSTER, WSOL_MINT } from "../config";
 import Diagnostics from "../components/Diagnostics";
@@ -18,7 +18,6 @@ import {
   describeError,
   inspectTransaction,
   messageOf,
-  rebuildWithoutLookupTables,
   signSendConfirm,
   simulateWithCost,
   toFailure,
@@ -51,6 +50,8 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   const [diag, setDiag] = useState(null);
   const [stage, setStage] = useState("");
   const [plan, setPlan] = useState(null);
+  // Chosen by the user after a failure; never switched automatically.
+  const [signMethod, setSignMethod] = useState("sign");
 
   // Create pool
   const [selectedMint, setSelectedMint] = useState(initialMint || "");
@@ -246,6 +247,23 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
       throw new StageError("prepare", "The Raydium SDK didn't return a transaction to sign.", { submitted: false });
     }
 
+    // Idempotent creation: if this pool address already exists on-chain, never build another
+    // initialization. (The address is derived from the token pair + fee config.)
+    let existing = null;
+    try {
+      existing = await connection.getAccountInfo(new PublicKey(prepared.poolId), "confirmed");
+    } catch (err) {
+      throw new StageError("prepare", `Couldn't check whether this pool already exists (${err?.message || err}). Nothing was sent.`, { submitted: false, cause: err });
+    }
+    if (existing) {
+      throw new StageError("prepare", "A pool for this token already exists on-chain, so BALNEX will not create another.", {
+        submitted: false,
+        poolExists: true,
+        poolId: prepared.poolId,
+        extra: { poolId: prepared.poolId },
+      });
+    }
+
     const inspection = await inspectTransaction(connection, tx, publicKey, prepared.programId);
     if (inspection.problems.length) {
       throw new StageError("prepare", `Transaction check failed: ${inspection.problems.join(" ")}`, {
@@ -289,9 +307,30 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
     };
   }
 
+  // User-requested retry: rebuilds the pool transaction from fresh chain state and a fresh
+  // blockhash and returns to the cost review. Nothing is signed until the user confirms again.
+  async function handleRetryBuild({ legacy = false, method = "sign" } = {}) {
+    if (busy) return;
+    clearFailure();
+    setPlan(null);
+    if (!selected) return;
+    setSignMethod(method);
+    setBusy(true);
+    setStage("Rebuilding from fresh on-chain data…");
+    try {
+      setPlan(await buildCreatePlan(legacy));
+    } catch (err) {
+      fail(err);
+    } finally {
+      setBusy(false);
+      setStage("");
+    }
+  }
+
   async function handleReviewPool() {
     clearFailure();
     setPlan(null);
+    setSignMethod("sign");
 
     if (!connected || !publicKey) {
       openConnect();
@@ -346,7 +385,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
       let active = plan;
       if (Date.now() - plan.builtAt > PLAN_MAX_AGE_MS) {
         setStage("Refreshing the transaction…");
-        active = await buildCreatePlan();
+        active = await buildCreatePlan(plan.legacy);
         if (active.cost.total > plan.cost.total * 1.02 + 10000) {
           setPlan(active);
           op.setExpectedPool(active.prepared.poolId);
@@ -384,47 +423,13 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
           },
           // Recorded the moment a signature exists, before waiting for confirmation.
           onSubmitted: (signature, blockhash) => op.submitted({ signature, blockhash }),
+          method: signMethod,
         });
       };
 
-      let signature;
-      try {
-        ({ signature } = await run(active.prepared.built.transaction, active.inspection, "v0 + lookup table"));
-      } catch (err) {
-        // Nothing was sent when signing fails, so re-formatting the same instructions is safe.
-        if (!(err instanceof StageError && err.stage === "signing" && err.details?.phantomInternal)) throw err;
-        console.warn("[BALNEX] v0 signing failed with -32603; retrying without lookup tables", describeError(err));
-        setStage("Re-formatting without lookup tables…");
-
-        let legacyTx;
-        let legacyInspection;
-        try {
-          legacyTx = await rebuildWithoutLookupTables(connection, active.prepared.built.transaction, publicKey);
-          legacyInspection = await inspectTransaction(connection, legacyTx, publicKey, active.prepared.programId);
-          if (legacyInspection.problems.length) throw new Error(legacyInspection.problems.join(" "));
-          if (legacyInspection.instructions.length !== active.inspection.instructions.length) {
-            throw new Error("Re-formatted transaction doesn't match the original instructions.");
-          }
-          await simulateWithCost(connection, legacyTx, publicKey);
-        } catch (fallbackErr) {
-          console.warn("[BALNEX] legacy re-format not possible:", fallbackErr);
-          err.details = {
-            ...err.details,
-            fallbackNotes: `Legacy re-format not possible: ${fallbackErr?.message || fallbackErr}`,
-            legacyInspection,
-          };
-          throw err;
-        }
-
-        try {
-          ({ signature } = await run(legacyTx, legacyInspection, "legacy (no lookup table)", "Retried after v0 -32603"));
-        } catch (legacyErr) {
-          if (legacyErr instanceof StageError) {
-            legacyErr.details = { ...legacyErr.details, v0Attempts: err.details?.attempts, v0Inspection: active.inspection };
-          }
-          throw legacyErr;
-        }
-      }
+      // ONE wallet request. If it fails (including Phantom -32603) nothing is retried automatically;
+      // the user chooses a retry, which rebuilds everything from fresh on-chain state.
+      const { signature } = await run(active.prepared.built.transaction, active.inspection, active.legacy ? "legacy (no lookup table)" : "v0 + lookup table");
 
       setStage("Verifying the pool on-chain…");
       await verifyPoolAccount(connection, active.prepared.poolId, active.prepared.programId, signature);
@@ -527,6 +532,32 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
                   View transaction ↗
                 </a>
               </p>
+            )}
+            {diag?.extra?.poolId ? (
+              <p>
+                Existing pool:{" "}
+                <a href={`https://explorer.solana.com/address/${diag.extra.poolId}${CLUSTER === "devnet" ? "?cluster=devnet" : ""}`} target="_blank" rel="noopener noreferrer">
+                  {shorten(diag.extra.poolId, 6, 6)} ↗
+                </a>
+                . Use VERIFY STATUS in the banner above to restore it if it's yours.
+              </p>
+            ) : null}
+            {diag?.stage === "signing" && (
+              <div className="button-row">
+                <button type="button" className="secondary-button compact" disabled={busy} onClick={() => handleRetryBuild({})}>
+                  Rebuild and retry
+                </button>
+                {diag?.walletErrorCode === -32603 && (
+                  <>
+                    <button type="button" className="secondary-button compact" disabled={busy} onClick={() => handleRetryBuild({ method: "signAndSend" })}>
+                      Rebuild, then use Phantom sign-and-send
+                    </button>
+                    <button type="button" className="secondary-button compact" disabled={busy} onClick={() => handleRetryBuild({ legacy: true })}>
+                      Rebuild without lookup tables
+                    </button>
+                  </>
+                )}
+              </div>
             )}
             <Diagnostics data={diag} />
             {errInfo?.title === "Wallet signing failed" && (

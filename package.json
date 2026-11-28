@@ -8,7 +8,7 @@
     "build": "vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "test": "node tests/lifecycleLock.test.mjs && node tests/social.test.mjs && node tests/feeGuards.test.mjs && node tests/chainOutcome.test.mjs"
+    "test": "node tests/lifecycleLock.test.mjs && node tests/social.test.mjs && node tests/feeGuards.test.mjs && node tests/chainOutcome.test.mjs && node tests/signing.test.mjs && node tests/utils.test.mjs && node tests/analytics.test.mjs"
   },
   "dependencies": {
     "@raydium-io/raydium-sdk-v2": "0.2.87-alpha",

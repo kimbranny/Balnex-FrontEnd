@@ -79,6 +79,7 @@ export function describeError(error) {
     confirmationStatus: details.status ?? null,
     rpcResponse: details.rpc ?? null,
     logs: details.logs ?? null,
+    extra: details.extra ?? null,
     stack: error?.stack ?? null,
   };
 }
@@ -369,9 +370,14 @@ async function fetchFailureDetails(connection, signature) {
 
 // Sign with the wallet, submit with preflight, then wait for a real confirmation.
 // Throws StageError for every failure; resolves only when the transaction confirmed.
-export async function signSendConfirm({ connection, transaction, signTransaction, sendTransaction, onStage, onSubmitted, context = {} }) {
+// `method` is chosen by the USER, never switched automatically:
+//   "sign"        wallet signs, BALNEX submits (default)
+//   "signAndSend" Phantom's own sign-and-send (only when the user picks it after a failure)
+// Exactly ONE wallet request is made per call. After any failure (including Phantom's -32603)
+// nothing is retried here; the caller must rebuild from fresh chain state on user request.
+export async function signSendConfirm({ connection, transaction, signTransaction, sendTransaction, onStage, onSubmitted, method = "sign", context = {} }) {
   try {
-    return await signSendConfirmInner({ connection, transaction, signTransaction, sendTransaction, onStage, onSubmitted });
+    return await signSendConfirmInner({ connection, transaction, signTransaction, sendTransaction, onStage, onSubmitted, method });
   } catch (err) {
     if (err instanceof StageError) err.details = { ...context, ...err.details };
     throw err;
@@ -394,21 +400,31 @@ const attemptRecord = (method, err) => ({
   message: err?.error?.message || err?.message || null,
 });
 
-async function signSendConfirmInner({ connection, transaction, signTransaction, sendTransaction, onStage, onSubmitted }) {
-  if (typeof signTransaction !== "function" && typeof sendTransaction !== "function") {
-    throw new StageError("signing", "Your wallet can't sign transactions. Reconnect Phantom and try again.", {
+async function signSendConfirmInner({ connection, transaction, signTransaction, sendTransaction, onStage, onSubmitted, method }) {
+  const useSignAndSend = method === "signAndSend";
+  if (useSignAndSend ? typeof sendTransaction !== "function" : typeof signTransaction !== "function") {
+    throw new StageError("signing", "Your wallet can't sign transactions this way. Reconnect Phantom and try again.", {
       submitted: false,
     });
   }
 
+  // Never hand a stale transaction to the wallet: if its blockhash is already expired, nothing is
+  // requested from the wallet and the caller must rebuild.
   const blockhash = messageOf(transaction).recentBlockhash;
+  const fresh = await connection.isBlockhashValid(blockhash, { commitment: "confirmed" }).then((r) => r.value).catch(() => null);
+  if (fresh === false) {
+    throw new StageError("prepare", "The transaction's blockhash expired before it was signed. Nothing was sent. Rebuild and try again.", {
+      submitted: false,
+      staleBlockhash: true,
+    });
+  }
+
   const attempts = [];
   let signature = null;
-
-  // Attempt 1: sign only, then BALNEX submits.
-  onStage?.("signing");
   let signed = null;
-  if (typeof signTransaction === "function") {
+
+  if (!useSignAndSend) {
+    onStage?.("signing");
     try {
       signed = await signTransaction(transaction);
     } catch (err) {
@@ -417,43 +433,15 @@ async function signSendConfirmInner({ connection, transaction, signTransaction, 
       if (isUserReject(err)) {
         throw new StageError("signing", "You cancelled the request in your wallet.", { submitted: false, attempts, cause: err });
       }
-      if (!isPhantomInternal(err) || typeof sendTransaction !== "function") {
-        throw new StageError("signing", attempts[0].message || "The wallet didn't sign the transaction.", {
-          submitted: false,
-          attempts,
-          cause: err,
-        });
-      }
-    }
-  }
-
-  // Attempt 2 (only after Phantom's -32603 on attempt 1, so nothing was sent yet):
-  // Phantom's own sign-and-send path, which some Phantom versions handle better.
-  if (!signed) {
-    onStage?.("signing-alt");
-    try {
-      signature = await sendTransaction(transaction, connection, {
-        skipPreflight: false,
-        preflightCommitment: "confirmed",
-        maxRetries: 5,
-      });
-    } catch (err) {
-      console.error("Wallet sendTransaction error:", err);
-      attempts.push(attemptRecord("signAndSendTransaction", err));
-      if (isUserReject(err)) {
-        throw new StageError("signing", "You cancelled the request in your wallet.", { submitted: false, attempts, cause: err });
-      }
-      const inner = err?.error || err;
-      const code = inner?.code ?? null;
+      // One request only. No automatic second wallet request after -32603.
       throw new StageError(
         "signing",
         isPhantomInternal(err)
-          ? "Phantom returned its internal error (-32603) on both signing methods. See Technical details."
-          : `The wallet couldn't sign and send: ${inner?.message || err}`,
-        { submitted: false, attempts, phantomInternal: isPhantomInternal(err), cause: err, walletCode: code }
+          ? "Phantom returned its internal error (-32603) while signing. Nothing was submitted. See Technical details."
+          : attempts[0].message || "The wallet didn't sign the transaction.",
+        { submitted: false, attempts, phantomInternal: isPhantomInternal(err), cause: err, walletCode: err?.error?.code ?? err?.code ?? null }
       );
     }
-  } else {
     onStage?.("submitting");
     try {
       signature = await connection.sendRawTransaction(signed.serialize(), {
@@ -473,6 +461,29 @@ async function signSendConfirmInner({ connection, transaction, signTransaction, 
         attempts,
         cause: err,
       });
+    }
+  } else {
+    onStage?.("signing-alt");
+    try {
+      signature = await sendTransaction(transaction, connection, {
+        skipPreflight: false,
+        preflightCommitment: "confirmed",
+        maxRetries: 5,
+      });
+    } catch (err) {
+      console.error("Wallet sendTransaction error:", err);
+      attempts.push(attemptRecord("signAndSendTransaction", err));
+      if (isUserReject(err)) {
+        throw new StageError("signing", "You cancelled the request in your wallet.", { submitted: false, attempts, cause: err });
+      }
+      const inner = err?.error || err;
+      throw new StageError(
+        "signing",
+        isPhantomInternal(err)
+          ? "Phantom returned its internal error (-32603) on sign-and-send. Nothing was confirmed as submitted. See Technical details."
+          : `The wallet couldn't sign and send: ${inner?.message || err}`,
+        { submitted: false, attempts, phantomInternal: isPhantomInternal(err), cause: err, walletCode: inner?.code ?? null }
+      );
     }
   }
 
