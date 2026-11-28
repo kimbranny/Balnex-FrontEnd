@@ -252,7 +252,7 @@ export function beginLifecycleOperation({ mint, type, allowedStates, pendingStat
               : type === "remove_liquidity" ? "removeLiquidity" : null;
         if (key) transactions[key] = details.signature;
       }
-      const unknown = state === "unknown" || state === "submitted";
+      const unknown = state === "unknown";
       const nextStatus = unknown ? "RECOVERY_REQUIRED"
         : state === "failed_no_submission" && type === "pool_create" ? "TOKEN_CREATED"
           : state === "failed_no_submission" && type === "remove_liquidity" ? "POOL_RUNNING"
@@ -352,7 +352,7 @@ export function markOperationOutcome(state, details = {}) {
     : current.operation?.type === "add_liquidity" ? "addLiquidity"
       : current.operation?.type === "remove_liquidity" ? "removeLiquidity" : null;
   if (signatureKey && details.signature) transactions[signatureKey] = details.signature;
-  const unknown = ["submitted", "unknown"].includes(state);
+  const unknown = state === "unknown";
   const nextStatus = unknown ? "RECOVERY_REQUIRED"
     : ["failed_no_submission", "failed_submitted"].includes(state) && current.operation?.type === "pool_create" ? "TOKEN_CREATED"
       : ["failed_no_submission", "failed_submitted"].includes(state) && current.operation?.type === "remove_liquidity" ? "POOL_RUNNING"
