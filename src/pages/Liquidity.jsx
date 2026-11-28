@@ -114,11 +114,63 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
         }));
         if (signatureResults.some((item) => item.status?.err)) {
           setLifecycleVerification({ mintExists: Boolean(mintInfo), signatures: signatureResults, outcome: "one_or_more_transactions_failed" });
+          const failedSignature = signatureResults.find((item) => item.status?.err)?.signature;
+          if (lifecycleLock.operation?.type === "pool_create" && lifecycleLock.poolId) {
+            const poolNow = await connection.getAccountInfo(new PublicKey(lifecycleLock.poolId), "confirmed");
+            if (poolNow) {
+              markOperationOutcome("unknown", { signature: failedSignature, reason: "Creation signature failed, but a pool account exists at the expected address. Verify pool identity and reserves before retrying." });
+              return;
+            }
+          }
           markOperationOutcome("failed_submitted", {
-            signature: signatureResults.find((item) => item.status?.err)?.signature,
-            reason: "A recorded lifecycle transaction failed on-chain. Verify mint/pool state before retrying.",
+            signature: failedSignature,
+            reason: "A recorded lifecycle transaction failed on-chain. The operation can be retried only after current state verification.",
           });
           return;
+        }
+
+        // A transaction interrupted before the submission stage is safe to rebuild.
+        if (["prepared", "signing", "signed"].includes(lifecycleLock.operation?.state)) {
+          markOperationOutcome("failed_no_submission", {
+            reason: "The previous operation stopped before submission. BALNEX restored its safe retry state.",
+          });
+          return;
+        }
+
+        // If the RPC call began but returned no signature, wait for its blockhash to
+        // expire and independently check state before permitting a retry.
+        if (lifecycleLock.operation?.state === "submitted" &&
+            !lifecycleLock.operation?.signature &&
+            Number.isFinite(lifecycleLock.operation?.lastValidBlockHeight)) {
+          const height = await connection.getBlockHeight("confirmed");
+          if (height > lifecycleLock.operation.lastValidBlockHeight) {
+            if (lifecycleLock.operation.type === "token_create" && !mintInfo) {
+              markOperationOutcome("failed_no_submission", { reason: "The signed token transaction's blockhash expired and the reserved mint account does not exist." });
+              return;
+            }
+            if (lifecycleLock.operation.type === "pool_create" && lifecycleLock.poolId) {
+              const poolNow = await connection.getAccountInfo(new PublicKey(lifecycleLock.poolId), "confirmed");
+              if (!poolNow) {
+                markOperationOutcome("failed_no_submission", { reason: "The pool transaction's blockhash expired and the derived pool account does not exist." });
+                return;
+              }
+            }
+            if (lifecycleLock.operation.type === "remove_liquidity" && lifecycleLock.poolId && publicKey?.toBase58() === lifecycleLock.wallet) {
+              const record = loadPoolRecords().find((item) => item.mint === lifecycleLock.mint && item.poolId === lifecycleLock.poolId);
+              if (record) {
+                const currentPosition = await verifyOne(record);
+                const before = lifecycleLock.operation.lpBalanceBefore;
+                const reservesBefore = lifecycleLock.operation.reservesBefore;
+                if (currentPosition.status === "verified" && before !== undefined &&
+                    currentPosition.lpRaw.toString() === String(before) &&
+                    Number(currentPosition.reserves.token) === Number(reservesBefore?.token) &&
+                    Number(currentPosition.reserves.sol) === Number(reservesBefore?.sol)) {
+                  markOperationOutcome("failed_no_submission", { reason: "The removal blockhash expired and the verified LP balance and pool reserves are unchanged." });
+                  return;
+                }
+              }
+            }
+          }
         }
         if (lifecycleLock.poolId) {
           const poolAccount = await connection.getAccountInfo(new PublicKey(lifecycleLock.poolId), "confirmed");
