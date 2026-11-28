@@ -264,10 +264,10 @@ export function markOperationOutcome(state, details = {}) {
     : current.operation?.type === "add_liquidity" ? "addLiquidity"
       : current.operation?.type === "remove_liquidity" ? "removeLiquidity" : null;
   if (signatureKey && details.signature) transactions[signatureKey] = details.signature;
-  const unknown = ["submitted", "unknown", "failed_submitted"].includes(state);
+  const unknown = ["submitted", "unknown"].includes(state);
   const nextStatus = unknown ? "RECOVERY_REQUIRED"
-    : state === "failed_no_submission" && current.operation?.type === "pool_create" ? "TOKEN_CREATED"
-      : state === "failed_no_submission" && current.operation?.type === "remove_liquidity" ? "POOL_RUNNING"
+    : ["failed_no_submission", "failed_submitted"].includes(state) && current.operation?.type === "pool_create" ? "TOKEN_CREATED"
+      : ["failed_no_submission", "failed_submitted"].includes(state) && current.operation?.type === "remove_liquidity" ? "POOL_RUNNING"
         : state === "confirmed" && current.operation?.type === "pool_create" ? "POOL_RUNNING"
           : state === "confirmed" && current.operation?.type === "add_liquidity" ? "POOL_RUNNING"
             : state === "confirmed" && current.operation?.type === "remove_liquidity" ? "REMOVAL_PENDING"
