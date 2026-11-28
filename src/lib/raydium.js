@@ -100,7 +100,7 @@ const wsolToken = () =>
 // Builds (does not send) the create-pool transaction.
 export async function prepareCreatePool(raydium, { mintInfo, tokenRaw, solRaw, legacy = false }) {
   const lock = getLifecycleLock();
-  if (!lock || lock.mint !== mintInfo.mint || !["TOKEN_CREATED", "POOL_PENDING", "RECOVERY_REQUIRED"].includes(lock.status)) {
+  if (!lock || lock.cluster !== CLUSTER || lock.mint !== mintInfo.mint || !["TOKEN_CREATED", "POOL_PENDING", "RECOVERY_REQUIRED"].includes(lock.status)) {
     throw new StageError("prepare", "Pool creation is blocked: this mint is not the token authorized by BALNEX's global lifecycle lock.", { submitted: false, mint: mintInfo.mint, lockStatus: lock?.status || "UNLOCKED" });
   }
   const sdk = await import("@raydium-io/raydium-sdk-v2");
@@ -173,7 +173,7 @@ export async function fetchPool(raydium, poolId) {
 
 export async function prepareAddLiquidity(raydium, { poolInfo, poolKeys, poolId, mint, amountRaw, baseIn, slippagePercent }) {
   const lock = getLifecycleLock();
-  if (!lock || lock.mint !== mint || (lock.poolId && lock.poolId !== poolId) || !["POOL_RUNNING", "ADD_LIQUIDITY_PENDING", "RECOVERY_REQUIRED"].includes(lock.status)) {
+  if (!lock || lock.cluster !== CLUSTER || lock.mint !== mint || (lock.poolId && lock.poolId !== poolId) || !["POOL_RUNNING", "ADD_LIQUIDITY_PENDING", "RECOVERY_REQUIRED"].includes(lock.status)) {
     throw new StageError("prepare", "Adding liquidity is blocked because this pool does not match the active global token lifecycle.", { submitted: false, poolId, mint, lockStatus: lock?.status || "UNLOCKED" });
   }
   const sdk = await import("@raydium-io/raydium-sdk-v2");
@@ -196,7 +196,7 @@ export async function prepareAddLiquidity(raydium, { poolInfo, poolKeys, poolId,
 
 export async function prepareRemoveLiquidity(raydium, { poolInfo, poolKeys, poolId, mint, lpRaw, slippagePercent }) {
   const lock = getLifecycleLock();
-  if (!lock || lock.mint !== mint || (lock.poolId && lock.poolId !== poolId) || !["POOL_RUNNING", "REMOVAL_PENDING", "RECOVERY_REQUIRED"].includes(lock.status)) {
+  if (!lock || lock.cluster !== CLUSTER || lock.mint !== mint || (lock.poolId && lock.poolId !== poolId) || !["POOL_RUNNING", "REMOVAL_PENDING", "RECOVERY_REQUIRED"].includes(lock.status)) {
     throw new StageError("prepare", "Liquidity removal is blocked because this pool does not match the active global token lifecycle.", { submitted: false, poolId, mint, lockStatus: lock?.status || "UNLOCKED" });
   }
   const sdk = await import("@raydium-io/raydium-sdk-v2");
