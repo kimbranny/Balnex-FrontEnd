@@ -11,6 +11,7 @@ import {
   createSetAuthorityInstruction,
   getAssociatedTokenAddressSync,
   getMinimumBalanceForRentExemptMint,
+  getMint,
   MINT_SIZE,
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
@@ -21,9 +22,10 @@ import { explorerAddress, explorerTx, friendlyError, saveLocalToken, shorten } f
 import { useWalletTokens } from "./lib/useWalletTokens";
 import Liquidity from "./pages/Liquidity";
 import LaunchCard from "./components/LaunchCard";
-import { getActiveLaunch, startLaunch, useActiveLaunch } from "./lib/launch";
+import { acquireCrossTabOperationLock, beginLifecycleOperation, getLifecycleLock, markTokenCreated, replaceReservedMint, reserveTokenLifecycle, useActiveLaunch, useLifecycleLock } from "./lib/launch";
 import { createMetadataInstruction } from "./lib/metadata";
 import { MAX_NAME_BYTES, MAX_SYMBOL_BYTES } from "./lib/metadataCodec";
+import { signatureFromSignedTransaction } from "./lib/txRunner";
 import Manage from "./pages/Manage";
 import Trending from "./pages/Trending";
 
@@ -91,9 +93,9 @@ export default function App() {
   const notify = useToast();
   const walletTokens = useWalletTokens();
 
-  // One unfinished launch per wallet (per network). See lib/launch.js.
-  const walletAddress = publicKey ? publicKey.toBase58() : "";
-  const launch = useActiveLaunch(walletAddress);
+  // One application-wide lifecycle lock per network. See lib/lifecycleLock.js.
+  const launch = useActiveLaunch();
+  const lifecycleLock = useLifecycleLock();
   const creatingRef = useRef(false);
   const prevLaunch = useRef(null);
 
@@ -130,6 +132,22 @@ export default function App() {
   const [createdToken, setCreatedToken] = useState(null);
 
   const [faqOpen, setFaqOpen] = useState(null);
+
+  // Restore the exact token form choices for a reservation whose wallet signing
+  // definitively failed before submission. A new mint keypair is generated on retry.
+  useEffect(() => {
+    if (!lifecycleLock || lifecycleLock.status !== "TOKEN_RESERVED") return;
+    setName(lifecycleLock.name || "");
+    setSymbol(lifecycleLock.symbol || "");
+    setSupply(lifecycleLock.supply || "1000000000");
+    if (lifecycleLock.decimals !== null && lifecycleLock.decimals !== undefined) setDecimals(String(lifecycleLock.decimals));
+    if (lifecycleLock.creationOptions) {
+      setMintAuthority(lifecycleLock.creationOptions.mintAuthority || "revoke");
+      setFreezeAuthority(lifecycleLock.creationOptions.freezeAuthority || "revoke");
+      setUpdateAuthority(lifecycleLock.creationOptions.updateAuthority || "retain");
+      setDescription(lifecycleLock.creationOptions.description || "");
+    }
+  }, [lifecycleLock?.id, lifecycleLock?.status]);
 
   // Close the menu with Escape and stop the page scrolling behind it.
   useEffect(() => {
@@ -232,23 +250,56 @@ export default function App() {
       return;
     }
 
-    // Launch lock, enforced here in application logic (not just by hiding the button).
-    // Read straight from storage so a stale render can't bypass it.
-    const pending = getActiveLaunch(publicKey.toBase58());
-    if (pending) {
-      notify("Finish or abandon your current launch before creating another token.", "error");
-      navigate("create");
-      return;
-    }
+    // Synchronous global guard and persistent reservation happen before the first RPC await.
     if (creatingRef.current) return;
     creatingRef.current = true;
 
     setIsCreating(true);
     setCreateError("");
 
+    let lifecycleOperation = null;
+    let crossTabOperation = null;
+    let mintKeypair = null;
+    let walletSigned = false;
+    let submittedSignature = null;
+    let signedSignature = null;
     try {
-      // Generate a new mint account for this token.
-      const mintKeypair = Keypair.generate();
+      crossTabOperation = await acquireCrossTabOperationLock();
+      if (!crossTabOperation) throw new Error("Another BALNEX browser tab is performing a lifecycle operation. Wait for it to finish, then retry.");
+      const wallet = publicKey.toBase58();
+      const existing = getLifecycleLock();
+      if (existing) {
+        if (
+          existing.status !== "TOKEN_RESERVED" ||
+          existing.operation?.state !== "failed_no_submission" ||
+          existing.wallet !== wallet ||
+          existing.name !== name.trim() ||
+          existing.symbol !== symbol
+        ) {
+          throw new Error(`BALNEX is locked to ${existing.name || "the current token"} (${existing.symbol || "token"}). Resume that lifecycle instead of creating another token.`);
+        }
+        // The prior attempt was proven not submitted. A new mint keypair is safe only
+        // after the old reservation's operation record explicitly says no submission.
+        mintKeypair = Keypair.generate();
+        replaceReservedMint(mintKeypair.publicKey.toBase58(), name.trim(), symbol);
+      } else {
+        mintKeypair = Keypair.generate();
+        reserveTokenLifecycle({
+          wallet,
+          mint: mintKeypair.publicKey.toBase58(),
+          name: name.trim(),
+          symbol,
+          decimals: Number(decimals),
+          supply,
+          creationOptions: { mintAuthority, freezeAuthority, updateAuthority, description },
+        });
+      }
+      lifecycleOperation = beginLifecycleOperation({
+        mint: mintKeypair.publicKey.toBase58(),
+        type: "token_create",
+        allowedStates: ["TOKEN_RESERVED"],
+        pendingStatus: "TOKEN_RESERVED",
+      });
 
       // Convert the whole-number supply into the smallest token units.
       const tokenDecimals = Number(decimals);
@@ -378,27 +429,55 @@ export default function App() {
       // Sign the new mint account with its generated keypair.
       transaction.partialSign(mintKeypair);
 
-      // Ask Phantom to approve and sign the transaction.
-      const signedTransaction = await signTransaction(transaction);
+      const blockhashCheck = await connection.isBlockhashValid(latestBlockhash.blockhash, { commitment: "confirmed" });
+      if (!blockhashCheck.value) {
+        throw new Error("The token creation blockhash expired before signing. Retry to rebuild the transaction with a fresh blockhash.");
+      }
 
-      // Submit the signed transaction to the configured Solana network.
+      // Ask Phantom to approve and sign the transaction.
+      lifecycleOperation.update("signing", {
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+      });
+      const signedTransaction = await signTransaction(transaction);
+      walletSigned = true;
+      signedSignature = signatureFromSignedTransaction(signedTransaction);
+      lifecycleOperation.update("signed", { signature: signedSignature || null });
+
+      // Persist submission intent BEFORE the RPC call. If the tab closes while the RPC
+      // response is in flight, startup recovery must not offer a blind retry.
+      lifecycleOperation.update("submitted", {
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+        ...(signedSignature ? { signature: signedSignature } : {}),
+        reason: "Token transaction submission is in progress; signature not returned yet.",
+      });
       const signature = await connection.sendRawTransaction(signedTransaction.serialize(), {
         skipPreflight: false,
         preflightCommitment: "confirmed",
       });
+      submittedSignature = signature;
+      lifecycleOperation.update("submitted", { signature });
 
-      // Wait for blockchain confirmation.
+      // Wait for finalized blockchain confirmation.
       const confirmation = await connection.confirmTransaction(
         {
           signature,
           blockhash: latestBlockhash.blockhash,
           lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
         },
-        "confirmed"
+        "finalized"
       );
 
       if (confirmation.value.err) {
         throw new Error("The Solana transaction failed. No successful token creation was confirmed.");
+      }
+
+      // Independently verify the finalized SPL mint and its issued supply before advancing
+      // the lifecycle or enabling the liquidity workflow.
+      const confirmedMint = await getMint(connection, mintKeypair.publicKey, "finalized", TOKEN_PROGRAM_ID);
+      if (confirmedMint.decimals !== tokenDecimals || confirmedMint.supply !== baseUnits) {
+        throw new Error("The transaction finalized, but the on-chain mint decimals or supply do not match the token configuration.");
       }
 
       const token = {
@@ -418,6 +497,12 @@ export default function App() {
         createdAt: Date.now(),
       };
 
+      // Confirmed mint: advance the reserved global lifecycle before routing to liquidity.
+      markTokenCreated({ wallet: publicKey.toBase58(), signature, mint: token.mint, name: token.name, symbol: token.symbol, decimals: tokenDecimals, supply });
+      lifecycleOperation.update("confirmed", { signature });
+      lifecycleOperation.release();
+      lifecycleOperation = null;
+
       // Remember name/symbol locally (the logo is too large for localStorage).
       saveLocalToken({
         mint: token.mint,
@@ -428,26 +513,34 @@ export default function App() {
         createdAt: token.createdAt,
       });
 
-      // Confirmed on-chain: lock the wallet to this launch, then go straight to Create Pool.
-      startLaunch({
-        wallet: publicKey.toBase58(),
-        mint: token.mint,
-        name: token.name,
-        symbol: token.symbol,
-        signature,
-        decimals: tokenDecimals,
-      });
-
+      // The global lifecycle is already persisted; route directly to its liquidity workflow.
       setCreatedToken(token);
       notify("Token created. Now create its liquidity pool.", "success");
       walletTokens.refresh();
       openLiquidity(token.mint);
     } catch (error) {
       console.error("Token creation error:", error);
+      if (lifecycleOperation) {
+        try {
+          if (submittedSignature || walletSigned) {
+            lifecycleOperation.update("unknown", {
+              ...(submittedSignature || signedSignature ? { signature: submittedSignature || signedSignature } : {}),
+              reason: "Token transaction submission or confirmation outcome is uncertain.",
+            });
+          } else {
+            lifecycleOperation.update("failed_no_submission", { reason: "Wallet signing failed or transaction was not submitted." });
+          }
+        } catch (persistError) {
+          console.error("[BALNEX] Could not update lifecycle recovery state:", persistError);
+        }
+        lifecycleOperation.release();
+      }
       const message = friendlyError(error);
       setCreateError(message);
       notify(message, "error");
     } finally {
+      lifecycleOperation?.release();
+      crossTabOperation?.release();
       creatingRef.current = false;
       setIsCreating(false);
     }
@@ -537,6 +630,8 @@ export default function App() {
             <button
               key={item.id}
               type="button"
+              disabled={item.id === "create" && Boolean(lifecycleLock)}
+              title={item.id === "create" && lifecycleLock ? "Complete the locked token's liquidity lifecycle first." : undefined}
               className={page === item.id ? "top-link active" : "top-link"}
               onClick={() => navigate(item.id)}
             >
@@ -551,6 +646,22 @@ export default function App() {
         </div>
       </header>
 
+      {lifecycleLock && (
+        <section className="global-lock-banner" role="status">
+          <div className="global-lock-copy">
+            <strong>LIQUIDITY WORKFLOW LOCKED</strong>
+            <span>Token: {lifecycleLock.name || "Unnamed"} ({lifecycleLock.symbol || "—"})</span>
+            <span>Status: {lifecycleLock.status.replaceAll("_", " ")}</span>
+            <span>Network: {String(lifecycleLock.cluster || CLUSTER).toUpperCase()}</span>
+            <small>You must complete or resolve this token's liquidity lifecycle before creating another token.</small>
+          </div>
+          <button type="button" className="primary" onClick={() => {
+            if (lifecycleLock.status === "TOKEN_RESERVED") navigate("create");
+            else openLiquidity(lifecycleLock.mint);
+          }}>{lifecycleLock.status === "TOKEN_RESERVED" ? "RESUME TOKEN CREATION" : "RESUME CURRENT TOKEN"}</button>
+        </section>
+      )}
+
       {/* MENU */}
       {menuOpen && (
         <>
@@ -561,6 +672,8 @@ export default function App() {
               <button
                 key={item.id}
                 type="button"
+                disabled={item.id === "create" && Boolean(lifecycleLock)}
+                title={item.id === "create" && lifecycleLock ? "Complete the locked token's liquidity lifecycle first." : undefined}
                 className={page === item.id ? "nav-item selected" : "nav-item"}
                 onClick={() => navigate(item.id)}
               >
@@ -578,7 +691,11 @@ export default function App() {
         {/* CREATE TOKEN */}
         {page === "create" && launch && (
           <section className="panel">
-            <LaunchCard launch={launch} onContinue={() => openLiquidity(launch.mint)} />
+            <LaunchCard launch={launch} onContinue={() => {
+              if (lifecycleLock?.status === "TOKEN_RESERVED" && lifecycleLock.operation?.state === "failed_no_submission") createToken();
+              else if (lifecycleLock?.status === "TOKEN_RESERVED") notify("Token creation is reserved. Verify the prior operation before retrying.", "info");
+              else openLiquidity(launch.mint);
+            }} />
           </section>
         )}
 
@@ -897,7 +1014,7 @@ export default function App() {
                     <button className="secondary-button" type="button" disabled={isCreating} onClick={() => goToStep(2)}>
                       ← Back
                     </button>
-                    <button className="primary" type="button" disabled={isCreating} onClick={createToken}>
+                    <button className="primary" type="button" disabled={isCreating || Boolean(lifecycleLock)} onClick={createToken}>
                       {isCreating ? (
                         <>
                           <span className="spinner" aria-hidden="true" /> Waiting for confirmation…
@@ -1055,7 +1172,7 @@ export default function App() {
         </div>
         <p>Built for the Solana ecosystem.</p>
         <div className="footer-links">
-          <button type="button" onClick={() => navigate("create")}>Create</button>
+          <button type="button" disabled={Boolean(lifecycleLock)} title={lifecycleLock ? "Complete the locked token's liquidity lifecycle first." : undefined} onClick={() => navigate("create")}>Create</button>
           <button type="button" onClick={() => navigate("tokens")}>My Tokens</button>
           <button type="button" onClick={() => navigate("liquidity")}>Liquidity</button>
           <button type="button" onClick={() => navigate("help")}>Help</button>

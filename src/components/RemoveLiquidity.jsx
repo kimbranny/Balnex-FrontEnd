@@ -3,6 +3,7 @@ import { prepareRemoveLiquidity } from "../lib/raydium";
 import { verifyPool } from "../lib/pools";
 import { inspectTransaction, refreshTransactionBlockhash, signSendConfirm, simulateWithCost, toFailure } from "../lib/txRunner";
 import { explorerTx, fromRawUnits, shorten } from "../lib/utils";
+import { acquireCrossTabOperationLock, beginLifecycleOperation, getLifecycleLock, markOperationOutcome } from "../lib/lifecycleLock";
 import Diagnostics from "./Diagnostics";
 
 const SLIPPAGE_OPTIONS = [0.5, 1, 3];
@@ -42,10 +43,25 @@ export default function RemoveLiquidity({
     if (inFlight.current || burn <= 0n) return;
     inFlight.current = true;
     const selectedPercent = percent;
+    let lifecycleOp = null;
+    let crossTabOperation = null;
+    let submittedSignature = null;
     setFailure(null);
     setDone(null);
     setBusy(true);
     try {
+      crossTabOperation = await acquireCrossTabOperationLock();
+      if (!crossTabOperation) throw new Error("Another BALNEX browser tab is performing a lifecycle operation. Wait for it to finish, then retry.");
+      const currentLock = getLifecycleLock();
+      if (!currentLock || currentLock.mint !== record.mint || currentLock.poolId && currentLock.poolId !== record.poolId) {
+        throw new Error("Removal is blocked because this pool is not the token reserved by BALNEX's global lifecycle lock.");
+      }
+      lifecycleOp = beginLifecycleOperation({
+        mint: record.mint,
+        type: "remove_liquidity",
+        allowedStates: ["POOL_RUNNING", "REMOVAL_PENDING"],
+        pendingStatus: "REMOVAL_PENDING",
+      });
       setStage("Refreshing pool and LP position…");
       const raydium = await getRaydium();
       const current = await verifyPool({
@@ -66,6 +82,8 @@ export default function RemoveLiquidity({
       const built = await prepareRemoveLiquidity(raydium, {
         poolInfo: current.poolInfo,
         poolKeys: current.poolKeys,
+        poolId: record.poolId,
+        mint: record.mint,
         lpRaw: freshBurn,
         slippagePercent: slippage,
       });
@@ -110,7 +128,26 @@ export default function RemoveLiquidity({
             lpDecimals: current.lpDecimals,
           },
         },
-        onStage: (name) => setStage(({ signing: "Waiting for Phantom approval…", submitting: "Sending…", confirming: "Waiting for confirmation…" })[name] || ""),
+        onSigned: (signedSignature) => lifecycleOp.update("signed", {
+          signature: signedSignature, poolId: active.prepared.poolId,
+          blockhash: active.blockhash, lastValidBlockHeight: active.lastValidBlockHeight,
+        }),
+        onSubmitted: (signature) => {
+          submittedSignature = signature;
+          lifecycleOp.update("submitted", { signature, poolId: record.poolId });
+        },
+        onStage: (name) => {
+          setStage(({ signing: "Waiting for Phantom approval…", submitting: "Sending…", confirming: "Waiting for confirmation…" })[name] || "");
+          if (name === "signing") lifecycleOp.update("signing", {
+            poolId: record.poolId, blockhash: refreshed.blockhash, lastValidBlockHeight: refreshed.lastValidBlockHeight,
+            lpBalanceBefore: current.lpRaw.toString(), reservesBefore: current.reserves,
+          });
+          if (name === "submitting") lifecycleOp.update("submitted", {
+            poolId: record.poolId, blockhash: refreshed.blockhash, lastValidBlockHeight: refreshed.lastValidBlockHeight,
+            lpBalanceBefore: current.lpRaw.toString(), reservesBefore: current.reserves,
+            reason: "Removal submission is in progress; signature not returned yet.",
+          });
+        },
       });
 
       setStage("Verifying withdrawal on-chain…");
@@ -126,6 +163,8 @@ export default function RemoveLiquidity({
       if (after.lpRaw >= current.lpRaw) {
         throw new Error("The transaction confirmed, but the wallet's LP balance did not decrease as expected. Check the transaction before retrying.");
       }
+      lifecycleOp.update("confirmed", { signature, poolId: record.poolId });
+      markOperationOutcome("confirmed", { signature, poolId: record.poolId });
 
       setDone({ signature, percent: selectedPercent });
       setPercent("");
@@ -138,9 +177,20 @@ export default function RemoveLiquidity({
         notify("Withdrawal is verified on-chain, but the position display could not refresh. Reopen this pool to reload it.", "info");
       }
     } catch (err) {
+      if (lifecycleOp) {
+        try {
+          const details = err?.details || {};
+          lifecycleOp.update(details.landed === "failed" ? "failed_submitted" : details.submitted || submittedSignature ? "unknown" : "failed_no_submission", {
+            ...(details.signature || submittedSignature ? { signature: details.signature || submittedSignature } : {}),
+            reason: err?.message || "Liquidity removal failed.",
+          });
+        } catch (stateError) { console.error("[BALNEX] withdrawal lifecycle recovery update failed", stateError); }
+      }
       setFailure(toFailure(err));
       notify("Withdrawal did not complete. See details below.", "error");
     } finally {
+      lifecycleOp?.release();
+      crossTabOperation?.release();
       inFlight.current = false;
       setBusy(false);
       setStage("");
