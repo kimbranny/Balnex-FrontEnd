@@ -410,6 +410,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
 
       setStage("Verifying the pool on-chain…");
       await verifyPoolAccount(connection, active.prepared.poolId, active.prepared.programId, signature);
+      pendingCreation.current = null;
 
       const record = {
         poolId: active.prepared.poolId,
