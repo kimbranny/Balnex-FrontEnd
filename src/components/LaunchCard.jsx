@@ -6,7 +6,8 @@ export default function LaunchCard({ launch, onContinue }) {
   const lifecycle = launch.lifecycleStatus || (launch.status === "liquidity_created" ? "POOL_RUNNING" : "TOKEN_CREATED");
   const label = launch.symbol ? `$${launch.symbol}` : shorten(launch.mint, 4, 4);
   const safeSigningRetry = launch.cluster === CLUSTER && lifecycle === "TOKEN_RESERVED" && launch.operation?.state === "failed_no_submission";
-  const recovery = lifecycle === "RECOVERY_REQUIRED" || ["unknown", "submitted", "failed_submitted"].includes(launch.operation?.state) || Boolean(launch.recovery) || safeSigningRetry;
+  const submittedPending = launch.operation?.state === "submitted";
+  const recovery = lifecycle === "RECOVERY_REQUIRED" || ["unknown", "failed_submitted"].includes(launch.operation?.state) || Boolean(launch.recovery) || safeSigningRetry;
 
   return (
     <div className="pool-panel launch-card">
@@ -30,6 +31,7 @@ export default function LaunchCard({ launch, onContinue }) {
         {launch.operation?.signature && <div><dt>Latest transaction</dt><dd><a href={explorerTx(launch.operation.signature)} target="_blank" rel="noopener noreferrer">{shorten(launch.operation.signature, 6, 6)} ↗</a></dd></div>}
         <div><dt>Operation</dt><dd>{launch.operation?.type || "Token lifecycle"} · {launch.operation?.state || "awaiting action"}</dd></div>
       </dl>
+      {submittedPending && <div className="notice"><div><strong>Transaction submitted — awaiting finality</strong><p>Verify its signature and on-chain state before another attempt. The global lifecycle remains locked.</p></div></div>}
       {recovery && <div className="notice notice-error"><div>
         <strong>{safeSigningRetry ? "Wallet signing failed — nothing was submitted" : "Recovery required"}</strong>
         <p>{safeSigningRetry ? "The reserved token is retained. You can safely rebuild and retry token creation for this reservation." : "Transaction status must be verified on Devnet before another attempt. The global lock remains active."}</p>
