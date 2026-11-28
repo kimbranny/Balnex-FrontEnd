@@ -242,6 +242,37 @@ export function markRemovalVerified(details = {}) {
   });
 }
 
+export function markOperationPending(type, pendingStatus, details = {}) {
+  const current = getLifecycleLock();
+  if (!current) throw new Error("No active lifecycle lock.");
+  return transitionLifecycle(pendingStatus, {
+    operation: { type, state: "prepared", updatedAt: Date.now(), ...details },
+  });
+}
+
+export function markOperationOutcome(state, details = {}) {
+  const current = getLifecycleLock();
+  if (!current) throw new Error("No active lifecycle lock.");
+  const now = Date.now();
+  const transactions = { ...current.transactions };
+  const signatureKey = current.operation?.type === "pool_create" ? "poolCreation"
+    : current.operation?.type === "add_liquidity" ? "addLiquidity"
+      : current.operation?.type === "remove_liquidity" ? "removeLiquidity" : null;
+  if (signatureKey && details.signature) transactions[signatureKey] = details.signature;
+  const unknown = ["submitted", "unknown", "failed_submitted"].includes(state);
+  const nextStatus = unknown ? "RECOVERY_REQUIRED"
+    : state === "confirmed" && current.operation?.type === "pool_create" ? "POOL_RUNNING"
+      : state === "confirmed" && current.operation?.type === "add_liquidity" ? "POOL_RUNNING"
+        : state === "confirmed" && current.operation?.type === "remove_liquidity" ? "REMOVAL_PENDING"
+          : current.status;
+  return updateLifecycleLock({
+    transactions,
+    status: nextStatus,
+    operation: { ...(current.operation || {}), state, updatedAt: now, ...details },
+    ...(unknown ? { recovery: { reason: details.reason || state, at: now, signature: details.signature || current.operation?.signature || null } } : {}),
+  }, current.id);
+}
+
 export function markRemovalPending(details = {}) {
   return transitionLifecycle("REMOVAL_PENDING", {
     operation: { type: "remove_liquidity", state: "prepared", updatedAt: Date.now() },
