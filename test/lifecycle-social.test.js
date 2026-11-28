@@ -39,6 +39,22 @@ test("global lifecycle blocks a second token and persists across reads", () => {
   assert.equal(JSON.parse(localStorage.getItem("balnex:lifecycle-lock:v1:devnet")).id, lock.id);
 });
 
+
+test("signed but unsubmitted token attempt can safely reserve a fresh mint", () => {
+  localStorage.clear();
+  reserve();
+  const op = lifecycle.beginLifecycleOperation({
+    mint: mintA, type: "token_create", allowedStates: ["TOKEN_RESERVED"], pendingStatus: "TOKEN_RESERVED",
+  });
+  op.update("signed", { signature: "wallet-signed-not-broadcast" });
+  op.update("failed_no_submission", { reason: "Submission never started" });
+  op.release();
+  const next = lifecycle.replaceReservedMint(mintB, "Token A", "A");
+  assert.equal(next.mint, mintB);
+  assert.equal(next.transactions.tokenCreation, null);
+  assert.equal(next.operation.state, "prepared");
+});
+
 test("synchronous operation guard blocks concurrent pool attempts", () => {
   localStorage.clear();
   reserve();
