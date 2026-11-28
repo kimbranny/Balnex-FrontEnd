@@ -22,7 +22,7 @@ import { explorerAddress, explorerTx, friendlyError, saveLocalToken, shorten } f
 import { useWalletTokens } from "./lib/useWalletTokens";
 import Liquidity from "./pages/Liquidity";
 import LaunchCard from "./components/LaunchCard";
-import { beginLifecycleOperation, getLifecycleLock, markTokenCreated, replaceReservedMint, reserveTokenLifecycle, useActiveLaunch, useLifecycleLock } from "./lib/launch";
+import { acquireCrossTabOperationLock, beginLifecycleOperation, getLifecycleLock, markTokenCreated, replaceReservedMint, reserveTokenLifecycle, useActiveLaunch, useLifecycleLock } from "./lib/launch";
 import { createMetadataInstruction } from "./lib/metadata";
 import { MAX_NAME_BYTES, MAX_SYMBOL_BYTES } from "./lib/metadataCodec";
 import { signatureFromSignedTransaction } from "./lib/txRunner";
@@ -258,11 +258,14 @@ export default function App() {
     setCreateError("");
 
     let lifecycleOperation = null;
+    let crossTabOperation = null;
     let mintKeypair = null;
     let walletSigned = false;
     let submittedSignature = null;
     let signedSignature = null;
     try {
+      crossTabOperation = await acquireCrossTabOperationLock();
+      if (!crossTabOperation) throw new Error("Another BALNEX browser tab is performing a lifecycle operation. Wait for it to finish, then retry.");
       const wallet = publicKey.toBase58();
       const existing = getLifecycleLock();
       if (existing) {
@@ -536,6 +539,8 @@ export default function App() {
       setCreateError(message);
       notify(message, "error");
     } finally {
+      lifecycleOperation?.release();
+      crossTabOperation?.release();
       creatingRef.current = false;
       setIsCreating(false);
     }
