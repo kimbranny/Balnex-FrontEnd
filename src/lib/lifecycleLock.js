@@ -295,6 +295,9 @@ export function markLiquidityRemoved(wallet, mint, removalSignature, extra = {})
     extra.verified !== true ||
     extra.signatureStatus !== "finalized" ||
     String(extra.remainingLpRaw) !== "0" ||
+    extra.poolStatus !== "emptied" ||
+    Number(extra.reserves?.token) !== 0 ||
+    Number(extra.reserves?.sol) !== 0 ||
     current.operation?.state !== "confirmed"
   ) {
     throw new Error("A finalized removal signature and independently verified zero LP balance are required before releasing the global lock.");
