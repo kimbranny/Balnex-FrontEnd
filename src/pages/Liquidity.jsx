@@ -538,7 +538,11 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
           pendingCreation.current = { signature: submittedSignature, poolId: active.prepared.poolId };
           lifecycleOp.update("submitted", { signature: submittedSignature, poolId: active.prepared.poolId });
         },
-        onStage: (name) => setStage(({ signing: "Waiting for your wallet to sign…", submitting: "Sending to Solana Devnet…", confirming: "Waiting for confirmation…" })[name] || ""),
+        onStage: (name) => {
+          setStage(({ signing: "Waiting for your wallet to sign…", submitting: "Sending to Solana Devnet…", confirming: "Waiting for confirmation…" })[name] || "");
+          if (name === "signing") lifecycleOp.update("signing", { poolId: active.prepared.poolId, blockhash: active.blockhash, lastValidBlockHeight: active.lastValidBlockHeight });
+          if (name === "submitting") lifecycleOp.update("submitted", { poolId: active.prepared.poolId, blockhash: active.blockhash, lastValidBlockHeight: active.lastValidBlockHeight, reason: "Submission is in progress; signature not returned yet." });
+        },
       });
 
       setStage("Verifying the pool on-chain…");
