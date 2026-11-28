@@ -113,9 +113,11 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
           signature,
           status: statuses.value[index] || null,
         }));
-        if (signatureResults.some((item) => item.status?.err)) {
-          setLifecycleVerification({ mintExists: Boolean(mintInfo), signatures: signatureResults, outcome: "one_or_more_transactions_failed" });
-          const failedSignature = signatureResults.find((item) => item.status?.err)?.signature;
+        const activeSignature = lifecycleLock.operation?.signature || lifecycleLock.recovery?.signature;
+        const failedCurrentSignature = signatureResults.find((item) => item.signature === activeSignature && item.status?.err);
+        if (failedCurrentSignature) {
+          setLifecycleVerification({ mintExists: Boolean(mintInfo), signatures: signatureResults, outcome: "current_transaction_failed" });
+          const failedSignature = failedCurrentSignature.signature;
           if (lifecycleLock.operation?.type === "pool_create" && lifecycleLock.poolId) {
             const poolNow = await connection.getAccountInfo(new PublicKey(lifecycleLock.poolId), "confirmed");
             if (poolNow) {
@@ -770,7 +772,8 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
                 const info = await connection.getAccountInfo(mint, "confirmed");
                 if (!info || !info.owner.equals(TOKEN_PROGRAM_ID)) throw new Error("The reserved mint account is missing or is not owned by the SPL Token program.");
                 const parsedMint = await getMint(connection, mint, "confirmed", TOKEN_PROGRAM_ID);
-                if (parsedMint.decimals !== Number(lifecycleLock.decimals)) throw new Error("The finalized mint decimals do not match the reserved token configuration.");
+                const expectedSupply = BigInt(lifecycleLock.supply) * 10n ** BigInt(Number(lifecycleLock.decimals));
+                if (parsedMint.decimals !== Number(lifecycleLock.decimals) || parsedMint.supply !== expectedSupply) throw new Error("The finalized mint decimals or supply do not match the reserved token configuration.");
                 markTokenCreated({
                   wallet: lifecycleLock.wallet, mint: lifecycleLock.mint, name: lifecycleLock.name,
                   symbol: lifecycleLock.symbol, decimals: parsedMint.decimals, supply: lifecycleLock.supply, signature,
