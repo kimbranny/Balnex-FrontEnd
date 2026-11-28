@@ -177,6 +177,7 @@ export function transitionLifecycle(status, patch = {}) {
 export function beginLifecycleOperation({ mint, type, allowedStates, pendingStatus }) {
   const current = getLifecycleLock();
   if (!current) throw new Error("No active BALNEX token lifecycle exists.");
+  if (current.cluster !== CLUSTER) throw new Error(`The active token lifecycle belongs to ${current.cluster}. Switch back to that network before continuing.`);
   if (current.mint !== mint) throw new Error("This token is not the token reserved by the global BALNEX lifecycle lock.");
   if (operationInFlight) throw new Error("Another BALNEX lifecycle operation is already running.");
   if (current.operation?.state === "submitted" || current.operation?.state === "unknown") {
@@ -266,7 +267,7 @@ export function markPoolPending(details = {}) {
 
 export function markLiquidityCreated(wallet, mint, details = {}) {
   const current = getLifecycleLock();
-  if (!current || current.mint !== mint) throw new Error("Pool creation does not match the globally reserved token.");
+  if (!current || current.cluster !== CLUSTER || current.mint !== mint) throw new Error("Pool creation does not match the globally reserved token and network.");
   return transitionLifecycle("POOL_RUNNING", {
     poolId: details.poolId || current.poolId,
     transactions: {
@@ -338,7 +339,7 @@ export function markRemovalPending(details = {}) {
 
 export function markLiquidityRemoved(_wallet, mint, removalSignature, extra = {}) {
   const current = getLifecycleLock();
-  if (!current || current.mint !== mint) throw new Error("Removal verification does not match the globally reserved token.");
+  if (!current || current.cluster !== CLUSTER || current.mint !== mint) throw new Error("Removal verification does not match the globally reserved token and network.");
   if (
     !removalSignature ||
     extra.verified !== true ||
