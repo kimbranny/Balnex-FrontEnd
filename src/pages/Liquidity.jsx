@@ -134,6 +134,19 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
               const result = await verifyOne(record);
               if (cancelled) return;
               setLifecycleVerification({ mintExists: Boolean(mintInfo), signatures: signatureResults, pool: { status: result.status, lpRaw: result.lpRaw?.toString() || null, reserves: result.reserves || null } });
+              if (lifecycleLock.status === "REMOVAL_PENDING" &&
+                  lifecycleLock.transactions?.removeLiquidity &&
+                  signatureResults.some((item) => item.signature === lifecycleLock.transactions.removeLiquidity && item.status?.confirmationStatus === "finalized") &&
+                  result.status === "emptied" && result.lpRaw === 0n &&
+                  Number(result.reserves?.token) === 0 && Number(result.reserves?.sol) === 0) {
+                markOperationOutcome("confirmed", { signature: lifecycleLock.transactions.removeLiquidity });
+                markLiquidityRemoved(lifecycleLock.wallet, lifecycleLock.mint, lifecycleLock.transactions.removeLiquidity, {
+                  poolId: record.poolId, verified: true, signatureStatus: "finalized",
+                  remainingLpRaw: result.lpRaw.toString(), poolStatus: result.status, reserves: result.reserves,
+                  recoveryVerifiedAt: Date.now(),
+                });
+                return;
+              }
               if (result.status === "verified" && lifecycleLock.status !== "POOL_RUNNING") {
                 markLiquidityCreated(lifecycleLock.wallet, lifecycleLock.mint, {
                   poolId: record.poolId, creationSignature: record.signature,
@@ -142,6 +155,9 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
               if (result.status === "error") markOperationOutcome("unknown", { reason: result.message || "Pool RPC verification unavailable." });
             } else {
               setLifecycleVerification({ mintExists: Boolean(mintInfo), signatures: signatureResults, poolExists: true, outcome: "pool_exists_record_missing" });
+              if (lifecycleLock.operation?.state === "submitted" || lifecycleLock.operation?.state === "unknown") {
+                markOperationOutcome("unknown", { reason: "The pool account exists, but BALNEX has no matching saved pool record to verify its mint pair and reserves." });
+              }
             }
           } else {
             setLifecycleVerification({ mintExists: Boolean(mintInfo), signatures: signatureResults, poolExists: true, outcome: "wallet_reconnect_required" });
