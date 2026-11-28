@@ -375,7 +375,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
     } catch (err) {
       results.push(`simple legacy transaction: FAILED (${err?.error?.code ?? err?.code ?? "?"} ${err?.error?.message || err?.message})`);
     }
-    setDiag((prev) => ({ ...(prev || {}), walletSelfTest: results }));
+    setDiag((prev) => ({ ...prev, walletSelfTest: results }));
     notify(results.join(" · "), results.some((r) => r.includes("FAILED")) ? "error" : "success");
   }
 
