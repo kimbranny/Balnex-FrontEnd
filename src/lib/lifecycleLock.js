@@ -41,7 +41,7 @@ function persist(lock) {
   try {
     if (lock) localStorage.setItem(KEY, JSON.stringify(lock));
     else localStorage.removeItem(KEY);
-  } catch (error) {
+  } catch {
     throw new Error("BALNEX could not persist the global liquidity lock. Enable browser storage before continuing.");
   }
   emit();
@@ -196,7 +196,7 @@ export function beginLifecycleOperation({ mint, type, allowedStates, pendingStat
       const latest = getLifecycleLock();
       if (!latest || latest.id !== current.id) throw new Error("The lifecycle lock changed during this operation.");
       const now = Date.now();
-      const transactions = { ...(latest.transactions || {}) };
+      const transactions = { ...latest.transactions };
       if (details.signature) {
         const key = type === "token_create" ? "tokenCreation"
           : type === "pool_create" ? "poolCreation"
@@ -219,7 +219,7 @@ export function beginLifecycleOperation({ mint, type, allowedStates, pendingStat
         transactions,
         poolId: details.poolId || latest.poolId,
         status: nextStatus,
-        operation: { ...(latest.operation || {}), type, state, updatedAt: now, ...details },
+        operation: { ...latest.operation, type, state, updatedAt: now, ...details },
         ...(unknown ? { recovery: { reason: details.reason || state, at: now, signature: details.signature || null } } : state === "failed_no_submission" ? { recovery: { reason: details.reason || state, at: now, signature: null } } : { recovery: null }),
       }, current.id);
     },
@@ -316,7 +316,7 @@ export function markOperationOutcome(state, details = {}) {
   return updateLifecycleLock({
     transactions,
     status: nextStatus,
-    operation: { ...(current.operation || {}), state, updatedAt: now, ...details },
+    operation: { ...current.operation, state, updatedAt: now, ...details },
     ...(unknown ? { recovery: { reason: details.reason || state, at: now, signature: details.signature || current.operation?.signature || null } } : state === "failed_no_submission" ? { recovery: { reason: details.reason || state, at: now, signature: null } } : { recovery: null }),
   }, current.id);
 }
@@ -328,7 +328,7 @@ export function markRemovalPending(details = {}) {
   });
 }
 
-export function markLiquidityRemoved(wallet, mint, removalSignature, extra = {}) {
+export function markLiquidityRemoved(_wallet, mint, removalSignature, extra = {}) {
   const current = getLifecycleLock();
   if (!current || current.mint !== mint) throw new Error("Removal verification does not match the globally reserved token.");
   if (
