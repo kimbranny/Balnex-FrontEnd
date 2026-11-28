@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { fetchPool, prepareRemoveLiquidity } from "../lib/raydium";
+import { prepareRemoveLiquidity } from "../lib/raydium";
 import { verifyPool } from "../lib/pools";
 import { inspectTransaction, refreshTransactionBlockhash, signSendConfirm, simulateWithCost, toFailure } from "../lib/txRunner";
 import { explorerTx, fromRawUnits, shorten } from "../lib/utils";
@@ -99,7 +99,10 @@ export default function RemoveLiquidity({
           withdrawal: {
             poolId: record.poolId,
             lpMint: current.lpMint,
+            lpTokenAccounts: current.lpTokenAccounts,
             lpTokenBalance: current.lpRaw.toString(),
+            poolMints: [current.poolInfo.mintA.address, current.poolInfo.mintB.address],
+            poolReserves: current.reserves,
             requestedLpAmount: freshBurn.toString(),
             percent: selectedPercent,
             slippagePercent: slippage,
