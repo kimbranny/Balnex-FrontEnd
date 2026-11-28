@@ -7,7 +7,7 @@ import { CLUSTER, WSOL_MINT } from "../config";
 import Diagnostics from "../components/Diagnostics";
 import LaunchCard from "../components/LaunchCard";
 import PoolPanel from "../components/PoolPanel";
-import { markLiquidityCreated, markLiquidityRemoved, useActiveLaunch } from "../lib/launch";
+import { beginLifecycleOperation, getLifecycleLock, markLiquidityCreated, markLiquidityRemoved, markOperationOutcome, markOperationPending, setLifecycleVerification, useActiveLaunch, useLifecycleLock } from "../lib/launch";
 import RemoveLiquidity from "../components/RemoveLiquidity";
 import { deletePoolRecord, loadPoolRecords, savePoolRecord, verifyPool } from "../lib/pools";
 import { loadRaydium, prepareCreatePool, readMint } from "../lib/raydium";
@@ -67,7 +67,9 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   const verifyRun = useRef(0);
   const operationLock = useRef(false);
   const pendingCreation = useRef(null);
-  const launch = useActiveLaunch(owner);
+  const launch = useActiveLaunch();
+  const lifecycleLock = useLifecycleLock();
+  const lifecycleOperation = useRef(null);
 
   // Lifecycle sync from CHAIN-verified pool data. Creating a pool moves the launch to
   // liquidity_created but keeps the wallet locked; a pool that is verifiably drained on-chain
@@ -94,15 +96,17 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
     () => walletTokens.tokens.filter((token) => token.raw > 0n && token.mint !== WSOL_MINT),
     [walletTokens.tokens]
   );
-  const selected = usable.find((token) => token.mint === selectedMint) || null;
+  const lockedMint = lifecycleLock?.mint || "";
+  const selected = usable.find((token) => token.mint === (lockedMint || selectedMint)) || null;
 
   useEffect(() => {
-    if (initialMint) setSelectedMint(initialMint);
-  }, [initialMint]);
+    if (lifecycleLock?.mint) setSelectedMint(lifecycleLock.mint);
+    else if (initialMint) setSelectedMint(initialMint);
+  }, [initialMint, lifecycleLock?.mint]);
 
   useEffect(() => {
-    if (!selectedMint && usable.length > 0) setSelectedMint(usable[0].mint);
-  }, [selectedMint, usable]);
+    if (!lifecycleLock && !selectedMint && usable.length > 0) setSelectedMint(usable[0].mint);
+  }, [selectedMint, usable, lifecycleLock]);
 
   function pickPercent(value) {
     if (!selected) return;
@@ -158,13 +162,23 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   // the lock because liquidity is still in the pool.
   async function handleWithdrawn(record, signature) {
     const result = await refreshPool(record);
-    const closed = (result.status === "verified" || result.status === "emptied") && result.lpRaw === 0n;
+    const status = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
+    const finalized = status.value[0]?.confirmationStatus === "finalized" && !status.value[0]?.err;
+    const closed = finalized && result.status === "emptied" && result.lpRaw === 0n;
     if (!closed) {
       notify("Withdrawal confirmed. Some liquidity remains, so your launch stays active until all of it is removed.", "info");
       return;
     }
     savePoolRecord({ ...record, removalSignature: signature, removedAt: Date.now() });
-    markLiquidityRemoved(record.owner, record.mint, signature, { poolId: record.poolId });
+    markOperationOutcome("confirmed", { signature });
+    markLiquidityRemoved(record.owner, record.mint, signature, {
+      poolId: record.poolId,
+      verified: true,
+      signatureStatus: "finalized",
+      remainingLpRaw: result.lpRaw.toString(),
+      poolStatus: result.status,
+      reserves: result.reserves,
+    });
     setRecordsVersion((v) => v + 1);
     notify("All liquidity removed and confirmed on-chain. You can create your next token.", "success");
   }
@@ -212,6 +226,8 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
 
   // Step 1: read the mint, build the exact transaction, simulate it and show the full cost.
   async function buildCreatePlan(legacy = false) {
+    const currentLock = getLifecycleLock();
+    if (!currentLock || currentLock.mint !== selected.mint) throw new StageError("prepare", "Pool creation is blocked. Select the token reserved by the global BALNEX lifecycle.", { submitted: false });
     const mintInfo = await readMint(connection, selected.mint);
     const tokenRaw = toRawUnits(tokenAmount, mintInfo.decimals);
     const solRaw = toRawUnits(solAmount, 9);
@@ -328,11 +344,25 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   // Step 2: user confirmed the cost. Sign, send, confirm, verify.
   async function handleConfirmPool() {
     if (!plan || operationLock.current) return;
+    const currentLock = getLifecycleLock();
+    if (!currentLock || currentLock.mint !== plan.mintInfo.mint) {
+      fail(new Error("Pool creation is blocked: this token does not own the global lifecycle lock."));
+      return;
+    }
     operationLock.current = true;
     clearFailure();
     setBusy(true);
+    let lifecycleOp = null;
+    let submitted = null;
 
     try {
+      lifecycleOp = beginLifecycleOperation({
+        mint: plan.mintInfo.mint,
+        type: "pool_create",
+        allowedStates: ["TOKEN_CREATED", "POOL_PENDING", "RECOVERY_REQUIRED"],
+        pendingStatus: "POOL_PENDING",
+      });
+      lifecycleOp.update("prepared", { poolId: plan.prepared.poolId });
       let active = plan;
       if (Date.now() - plan.builtAt > PLAN_MAX_AGE_MS) {
         setStage("Refreshing the transaction…");
@@ -408,13 +438,16 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
           pool: { poolId: active.prepared.poolId, lpMint: active.prepared.lpMint, mint: selected.mint },
         },
         onSubmitted: (submittedSignature) => {
+          submitted = submittedSignature;
           pendingCreation.current = { signature: submittedSignature, poolId: active.prepared.poolId };
+          lifecycleOp.update("submitted", { signature: submittedSignature, poolId: active.prepared.poolId });
         },
         onStage: (name) => setStage(({ signing: "Waiting for your wallet to sign…", submitting: "Sending to Solana Devnet…", confirming: "Waiting for confirmation…" })[name] || ""),
       });
 
       setStage("Verifying the pool on-chain…");
       await verifyPoolAccount(connection, active.prepared.poolId, active.prepared.programId, signature);
+      lifecycleOp.update("confirmed", { signature, poolId: active.prepared.poolId });
       pendingCreation.current = null;
 
       const record = {
@@ -447,8 +480,18 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
       notify("Pool transaction confirmed. Verifying the pool on-chain…", "success");
       walletTokens.refresh();
     } catch (err) {
+      if (lifecycleOp) {
+        try {
+          const details = err?.details || {};
+          lifecycleOp.update(details.submitted || submitted ? "unknown" : "failed_no_submission", {
+            ...(details.signature || submitted ? { signature: details.signature || submitted } : {}),
+            reason: err?.message || "Pool creation failed.",
+          });
+        } catch (stateError) { console.error("[BALNEX] pool lifecycle recovery update failed", stateError); }
+      }
       fail(err);
     } finally {
+      lifecycleOp?.release();
       setBusy(false);
       setStage("");
       operationLock.current = false;
@@ -471,6 +514,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   const managingRecord = records.find((r) => r.poolId === managing);
   const managingVerified = managingRecord ? verifiedMap[managingRecord.poolId] : null;
   const showForm = records.length === 0 || showCreate;
+  const isLockedToken = Boolean(lifecycleLock && selected?.mint === lifecycleLock.mint);
 
   return (
     <section className="panel">
@@ -487,7 +531,34 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
         <div className="panel-icon">◈</div>
       </div>
 
-      {launch && <LaunchCard launch={launch} />}
+      {launch && <LaunchCard launch={launch} onContinue={() => setSelectedMint(launch.mint)} />}
+      {lifecycleLock?.recovery && (
+        <div className="notice notice-error" role="alert">
+          <div><strong>Recovery required — {lifecycleLock.operation?.type || "transaction"}</strong>
+            <p>{lifecycleLock.recovery.reason || "The previous transaction outcome is unresolved. Verify its signature before retrying."}</p>
+            <p>Mint: <code>{lifecycleLock.mint}</code></p>
+            {lifecycleLock.recovery.signature && <p>Signature: <a href={`https://explorer.solana.com/tx/${lifecycleLock.recovery.signature}?cluster=devnet`} target="_blank" rel="noopener noreferrer">{shorten(lifecycleLock.recovery.signature, 8, 8)} ↗</a></p>}
+          </div>
+        </div>
+      )}
+
+      {lifecycleLock?.operation?.state === "unknown" && (
+        <button type="button" className="secondary-button" disabled={busy} onClick={async () => {
+          const signature = lifecycleLock.operation?.signature || lifecycleLock.recovery?.signature;
+          if (!signature) { notify("No transaction signature is recorded; RPC verification is required before retry.", "error"); return; }
+          try {
+            const status = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
+            const account = lifecycleLock.poolId ? await connection.getAccountInfo(new PublicKey(lifecycleLock.poolId), "confirmed") : null;
+            setLifecycleVerification({ signature, status: status.value[0] || null, poolAccountExists: Boolean(account), checked: true });
+            if (status.value[0]?.err) markOperationOutcome("failed_submitted", { signature, reason: "Recorded transaction failed on-chain." });
+            else if (status.value[0]?.confirmationStatus === "finalized") markOperationOutcome("confirmed", { signature });
+            else notify("Transaction remains unconfirmed or unknown. The lock remains active.", "info");
+          } catch (verifyError) {
+            markOperationOutcome("unknown", { signature, reason: verifyError?.message || "RPC verification unavailable." });
+            notify("RPC verification failed. BALNEX kept the global lock.", "error");
+          }
+        }}>VERIFY STATUS</button>
+      )}
 
       {errInfo && (
         <div className="notice notice-error" role="alert">
