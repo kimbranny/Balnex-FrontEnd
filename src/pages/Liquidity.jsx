@@ -8,7 +8,7 @@ import { CLUSTER, WSOL_MINT } from "../config";
 import Diagnostics from "../components/Diagnostics";
 import LaunchCard from "../components/LaunchCard";
 import PoolPanel from "../components/PoolPanel";
-import { beginLifecycleOperation, getLifecycleLock, markLiquidityCreated, markLiquidityRemoved, markOperationOutcome, markRemovalVerified, setLifecycleVerification, updateLifecycleLock, useActiveLaunch, useLifecycleLock } from "../lib/launch";
+import { acquireCrossTabOperationLock, beginLifecycleOperation, getLifecycleLock, markLiquidityCreated, markLiquidityRemoved, markOperationOutcome, markRemovalVerified, setLifecycleVerification, updateLifecycleLock, useActiveLaunch, useLifecycleLock } from "../lib/launch";
 import RemoveLiquidity from "../components/RemoveLiquidity";
 import { deletePoolRecord, loadPoolRecords, savePoolRecord, verifyPool } from "../lib/pools";
 import { loadRaydium, prepareCreatePool, readMint } from "../lib/raydium";
@@ -563,9 +563,12 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
     clearFailure();
     setBusy(true);
     let lifecycleOp = null;
+    let crossTabOperation = null;
     let submitted = null;
 
     try {
+      crossTabOperation = await acquireCrossTabOperationLock();
+      if (!crossTabOperation) throw new Error("Another BALNEX browser tab is performing a lifecycle operation. Wait for it to finish, then retry.");
       lifecycleOp = beginLifecycleOperation({
         mint: plan.mintInfo.mint,
         type: "pool_create",
@@ -709,6 +712,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
       fail(err);
     } finally {
       lifecycleOp?.release();
+      crossTabOperation?.release();
       setBusy(false);
       setStage("");
       operationLock.current = false;
