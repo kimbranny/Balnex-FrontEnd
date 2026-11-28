@@ -7,7 +7,7 @@ import { CLUSTER, WSOL_MINT } from "../config";
 import Diagnostics from "../components/Diagnostics";
 import LaunchCard from "../components/LaunchCard";
 import PoolPanel from "../components/PoolPanel";
-import { beginLifecycleOperation, getLifecycleLock, markLiquidityCreated, markLiquidityRemoved, markOperationOutcome, markOperationPending, setLifecycleVerification, useActiveLaunch, useLifecycleLock } from "../lib/launch";
+import { beginLifecycleOperation, getLifecycleLock, markLiquidityCreated, markLiquidityRemoved, markOperationOutcome, markRemovalVerified, setLifecycleVerification, useActiveLaunch, useLifecycleLock } from "../lib/launch";
 import RemoveLiquidity from "../components/RemoveLiquidity";
 import { deletePoolRecord, loadPoolRecords, savePoolRecord, verifyPool } from "../lib/pools";
 import { loadRaydium, prepareCreatePool, readMint } from "../lib/raydium";
@@ -164,9 +164,16 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
     const result = await refreshPool(record);
     const status = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
     const finalized = status.value[0]?.confirmationStatus === "finalized" && !status.value[0]?.err;
-    const closed = finalized && result.status === "emptied" && result.lpRaw === 0n;
+    if (!finalized) {
+      markOperationOutcome("unknown", { signature, reason: "Removal signature is not finalized or RPC cannot verify it." });
+      notify("Removal status is not finalized. The global lock remains in recovery.", "error");
+      return;
+    }
+    const closed = result.status === "emptied" && result.lpRaw === 0n &&
+      Number(result.reserves?.token) === 0 && Number(result.reserves?.sol) === 0;
     if (!closed) {
-      notify("Withdrawal confirmed. Some liquidity remains, so your launch stays active until all of it is removed.", "info");
+      markRemovalVerified({ signature, remainingLpRaw: result.lpRaw.toString(), reserves: result.reserves, poolStatus: result.status });
+      notify("Withdrawal confirmed. Some liquidity remains, so the token lifecycle stays locked.", "info");
       return;
     }
     savePoolRecord({ ...record, removalSignature: signature, removedAt: Date.now() });
