@@ -162,7 +162,7 @@ export default function RemoveLiquidity({
       if (lifecycleOp) {
         try {
           const details = err?.details || {};
-          lifecycleOp.update(details.submitted || submittedSignature ? "unknown" : "failed_no_submission", {
+          lifecycleOp.update(details.landed === "failed" ? "failed_submitted" : details.submitted || submittedSignature ? "unknown" : "failed_no_submission", {
             ...(details.signature || submittedSignature ? { signature: details.signature || submittedSignature } : {}),
             reason: err?.message || "Liquidity removal failed.",
           });
