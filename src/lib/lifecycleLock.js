@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { CLUSTER } from "../config.js";
 
-const KEY = `balnex:lifecycle-lock:v1:${CLUSTER}`;
+const KEY = "balnex:lifecycle-lock:v1";
 const HISTORY_KEY = `balnex:lifecycle-history:v1:${CLUSTER}`;
 const EVENT = "balnex:lifecycle-lock-changed";
 
@@ -81,15 +81,18 @@ export function getLifecycleLock() {
   if (!lock) {
     // One-time migration from the previous wallet-scoped launch store. Active records
     // become the single global lock; completed/abandoned history never unlocks another lock.
-    const legacy = safeRead(`balnex:launches:v1:${CLUSTER}`, []);
-    const active = Array.isArray(legacy)
-      ? legacy.filter((item) => item && ["launch_pending", "liquidity_created"].includes(item.status))
-          .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0))[0]
-      : null;
+    const legacy = ["devnet", "mainnet"].flatMap((network) => {
+      const records = safeRead(`balnex:launches:v1:${network}`, []);
+      return Array.isArray(records)
+        ? records.filter((item) => item && ["launch_pending", "liquidity_created"].includes(item.status))
+            .map((item) => ({ ...item, cluster: item.cluster || network }))
+        : [];
+    });
+    const active = legacy.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0))[0];
     if (active) {
       const status = active.status === "liquidity_created" ? "POOL_RUNNING" : "TOKEN_CREATED";
       lock = {
-        id: `migrated-${active.mint}`, cluster: CLUSTER, wallet: active.wallet,
+        id: `migrated-${active.mint}`, cluster: active.cluster, wallet: active.wallet,
         mint: active.mint, name: active.name || "", symbol: active.symbol || "",
         decimals: active.decimals ?? null, supply: active.supply ?? null,
         status, poolId: active.poolId || null,
