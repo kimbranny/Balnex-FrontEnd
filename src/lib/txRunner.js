@@ -105,7 +105,7 @@ export function userMessage(error) {
   if (stage === "signing") {
     return {
       title: "Wallet signing failed",
-      outcome: "Nothing was submitted. No SOL or tokens moved. (The transaction passed simulation on the network before your wallet opened.)",
+      outcome: "Nothing was submitted. No SOL or tokens moved. The wallet rejected the signing request before network submission.",
       body: error.message,
     };
   }
@@ -154,23 +154,73 @@ export function userMessage(error) {
 // Re-compiles the SAME instructions without Address Lookup Tables (as a legacy message),
 // with a fresh blockhash. No instruction is added, removed or reordered; the caller
 // re-inspects and re-simulates the result before the wallet sees it.
+export async function refreshTransactionBlockhash(connection, tx, feePayer) {
+  if (!tx || !feePayer) {
+    throw new StageError("prepare", "A transaction and connected fee payer are required.", { submitted: false });
+  }
+
+  const alreadySigned = isVersioned(tx)
+    ? tx.signatures.some((signature) => signature.some((byte) => byte !== 0))
+    : (tx.signatures || []).some((entry) => entry.signature);
+  if (alreadySigned) {
+    throw new StageError("prepare", "The transaction already contains a signature and cannot be safely refreshed. Rebuild it from current pool state.", {
+      submitted: false,
+    });
+  }
+
+  const latest = await connection.getLatestBlockhash("confirmed");
+  if (isVersioned(tx)) {
+    tx.message.recentBlockhash = latest.blockhash;
+  } else {
+    tx.feePayer = feePayer;
+    tx.recentBlockhash = latest.blockhash;
+  }
+
+  const message = messageOf(tx);
+  const actualPayer = message.getAccountKeys().get(0);
+  if (!actualPayer || !actualPayer.equals(feePayer)) {
+    throw new StageError("prepare", "The transaction fee payer does not match the connected wallet.", {
+      submitted: false,
+      transactionFormat: isVersioned(tx) ? "versioned" : "legacy",
+    });
+  }
+
+  return {
+    transaction: tx,
+    blockhash: latest.blockhash,
+    lastValidBlockHeight: latest.lastValidBlockHeight,
+  };
+}
+
+// Kept as an explicit utility for diagnostics only. It is never invoked automatically
+// after a wallet signing error; a new format requires a fresh user-confirmed build.
 export async function rebuildWithoutLookupTables(connection, tx, feePayer) {
   const message = messageOf(tx);
   const lookups = message.addressTableLookups || [];
-  const alts = (
-    await Promise.all(lookups.map((l) => connection.getAddressLookupTable(l.accountKey).catch(() => null)))
-  )
-    .map((r) => r?.value)
-    .filter(Boolean);
-  if (alts.length !== lookups.length) {
-    throw new StageError("prepare", "Couldn't load the lookup table needed to rebuild the transaction.", { submitted: false });
+  if (!lookups.length) {
+    throw new StageError("prepare", "This transaction does not use address lookup tables; there is no lookup-table fallback to perform.", {
+      submitted: false,
+    });
   }
-
+  const alts = (
+    await Promise.all(lookups.map((lookup) => connection.getAddressLookupTable(lookup.accountKey).catch(() => null)))
+  ).map((result) => result?.value).filter(Boolean);
+  if (alts.length !== lookups.length) {
+    throw new StageError("prepare", "Couldn't resolve every address lookup table; refusing to alter the transaction.", { submitted: false });
+  }
   const decompiled = TransactionMessage.decompile(message, { addressLookupTableAccounts: alts });
   const { blockhash } = await connection.getLatestBlockhash("confirmed");
   decompiled.recentBlockhash = blockhash;
   decompiled.payerKey = feePayer;
-  return new VersionedTransaction(decompiled.compileToLegacyMessage());
+  const rebuilt = new VersionedTransaction(decompiled.compileToLegacyMessage());
+  const size = rebuilt.serialize().length;
+  if (size > MAX_TX_BYTES) {
+    throw new StageError("prepare", `The legacy transaction would be too large (${size} bytes).`, {
+      submitted: false,
+      transactionFormat: "legacy",
+    });
+  }
+  return rebuilt;
 }
 
 // Looks inside the transaction BEFORE the wallet sees it. Contains only public data
@@ -185,7 +235,14 @@ export async function inspectTransaction(connection, tx, owner, expectedProgramI
     const results = await Promise.all(lookups.map((l) => connection.getAddressLookupTable(l.accountKey).catch(() => null)));
     altAccounts = results.map((r) => r?.value).filter(Boolean);
   }
+  if (altAccounts.length !== lookups.length) {
+    throw new StageError("prepare", "One or more address lookup tables could not be resolved for transaction inspection.", {
+      submitted: false,
+      inspection: { usesAddressLookupTables: lookups.length > 0, lookupTables: lookups.map((lookup) => lookup.accountKey.toBase58()), resolvedLookupTables: altAccounts.length },
+    });
+  }
   const keys = message.getAccountKeys({ addressLookupTableAccounts: altAccounts });
+  const resolvedLookupAccountCount = altAccounts.reduce((total, table) => total + table.state.addresses.length, 0);
 
   const instructions = message.compiledInstructions.map((ix, index) => {
     const programId = keys.get(ix.programIdIndex).toBase58();
@@ -246,6 +303,8 @@ export async function inspectTransaction(connection, tx, owner, expectedProgramI
     blockhashValid,
     usesAddressLookupTables: lookups.length > 0,
     lookupTables: lookups.map((l) => l.accountKey.toBase58()),
+    resolvedLookupTableCount: altAccounts.length,
+    resolvedLookupAccountCount,
     instructionCount: instructions.length,
     instructions,
     requiredSigners: signerKeys,
@@ -284,7 +343,7 @@ export async function simulateWithCost(connection, rawTransaction, owner) {
   try {
     response = await connection.simulateTransaction(transaction, {
       sigVerify: false,
-      replaceRecentBlockhash: true,
+      replaceRecentBlockhash: false,
       commitment: "confirmed",
       accounts: { encoding: "base64", addresses: [owner.toBase58()] },
     });
@@ -333,7 +392,7 @@ async function waitForSignature(connection, signature, blockhash, timeoutMs = 90
       lastStatus = status || lastStatus;
 
       if (status?.err) return { state: "failed", status };
-      if (status && (status.confirmationStatus === "confirmed" || status.confirmationStatus === "finalized")) {
+      if (status && status.confirmationStatus === "finalized") {
         return { state: "confirmed", status };
       }
 
@@ -405,55 +464,28 @@ async function signSendConfirmInner({ connection, transaction, signTransaction, 
   const attempts = [];
   let signature = null;
 
-  // Attempt 1: sign only, then BALNEX submits.
+  // Use exactly one wallet path. A wallet error is not permission to prompt the
+  // wallet again with the same transaction or to submit a second transaction.
   onStage?.("signing");
-  let signed = null;
   if (typeof signTransaction === "function") {
+    let signed;
     try {
       signed = await signTransaction(transaction);
     } catch (err) {
       console.error("Wallet signTransaction error:", err);
       attempts.push(attemptRecord("signTransaction", err));
-      if (isUserReject(err)) {
-        throw new StageError("signing", "You cancelled the request in your wallet.", { submitted: false, attempts, cause: err });
-      }
-      if (!isPhantomInternal(err) || typeof sendTransaction !== "function") {
-        throw new StageError("signing", attempts[0].message || "The wallet didn't sign the transaction.", {
-          submitted: false,
-          attempts,
-          cause: err,
-        });
-      }
-    }
-  }
-
-  // Attempt 2 (only after Phantom's -32603 on attempt 1, so nothing was sent yet):
-  // Phantom's own sign-and-send path, which some Phantom versions handle better.
-  if (!signed) {
-    onStage?.("signing-alt");
-    try {
-      signature = await sendTransaction(transaction, connection, {
-        skipPreflight: false,
-        preflightCommitment: "confirmed",
-        maxRetries: 5,
-      });
-    } catch (err) {
-      console.error("Wallet sendTransaction error:", err);
-      attempts.push(attemptRecord("signAndSendTransaction", err));
-      if (isUserReject(err)) {
-        throw new StageError("signing", "You cancelled the request in your wallet.", { submitted: false, attempts, cause: err });
-      }
-      const inner = err?.error || err;
-      const code = inner?.code ?? null;
+      const rejected = isUserReject(err);
       throw new StageError(
         "signing",
-        isPhantomInternal(err)
-          ? "Phantom returned its internal error (-32603) on both signing methods. See Technical details."
-          : `The wallet couldn't sign and send: ${inner?.message || err}`,
-        { submitted: false, attempts, phantomInternal: isPhantomInternal(err), cause: err, walletCode: code }
+        rejected
+          ? "You cancelled the request in your wallet."
+          : isPhantomInternal(err)
+            ? "Phantom returned an internal error (-32603). No transaction was submitted. Rebuild and revalidate before trying again."
+            : (err?.error?.message || err?.message || "The wallet didn't sign the transaction."),
+        { submitted: false, attempts, phantomInternal: isPhantomInternal(err), cause: err }
       );
     }
-  } else {
+
     onStage?.("submitting");
     try {
       signature = await connection.sendRawTransaction(signed.serialize(), {
@@ -473,6 +505,28 @@ async function signSendConfirmInner({ connection, transaction, signTransaction, 
         attempts,
         cause: err,
       });
+    }
+  } else {
+    // Wallet-adapter sendTransaction is used only when signTransaction is not
+    // provided at all, never as a retry after a failed signing request.
+    try {
+      signature = await sendTransaction(transaction, connection, {
+        skipPreflight: false,
+        preflightCommitment: "confirmed",
+        maxRetries: 5,
+      });
+    } catch (err) {
+      console.error("Wallet sendTransaction error:", err);
+      attempts.push(attemptRecord("sendTransaction", err));
+      throw new StageError(
+        "signing",
+        isUserReject(err)
+          ? "You cancelled the request in your wallet."
+          : isPhantomInternal(err)
+            ? "Phantom returned an internal error (-32603). No transaction was submitted. Rebuild and revalidate before trying again."
+            : (err?.error?.message || err?.message || "The wallet couldn't sign and send."),
+        { submitted: false, attempts, phantomInternal: isPhantomInternal(err), cause: err }
+      );
     }
   }
 
