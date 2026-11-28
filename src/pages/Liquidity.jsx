@@ -63,13 +63,11 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   );
   const [verifiedMap, setVerifiedMap] = useState({});
   const [managing, setManaging] = useState("");
-  const [showCreate, setShowCreate] = useState(false);
   const verifyRun = useRef(0);
   const operationLock = useRef(false);
   const pendingCreation = useRef(null);
   const launch = useActiveLaunch();
   const lifecycleLock = useLifecycleLock();
-  const lifecycleOperation = useRef(null);
 
   // Lifecycle sync from CHAIN-verified pool data. Creating a pool moves the launch to
   // liquidity_created but keeps the wallet locked; a pool that is verifiably drained on-chain
@@ -570,7 +568,6 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
         solDeposited: record.solDeposited,
       });
       setPlan(null);
-      setShowCreate(false);
       setManaging("");
       setRecordsVersion((v) => v + 1);
       notify("Pool transaction confirmed. Verifying the pool on-chain…", "success");
