@@ -1,6 +1,4 @@
-import { CLUSTER } from "../config.js";
-
-const KEY = `balnex:social-links:v1:${CLUSTER}`;
+const KEY = "balnex:social-links:v1";
 
 export const SOCIAL_FIELDS = [
   { key: "website", label: "Website", placeholder: "https://example.com" },
