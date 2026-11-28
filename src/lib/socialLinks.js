@@ -1,4 +1,4 @@
-import { CLUSTER } from "../config";
+import { CLUSTER } from "../config.js";
 
 const KEY = `balnex:social-links:v1:${CLUSTER}`;
 
