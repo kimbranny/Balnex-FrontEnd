@@ -94,10 +94,11 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
 
   // Startup / reconnect recovery: never infer success from local UI state. Re-check
   // the recorded mint and signatures on the configured cluster; RPC failure retains lock.
-  const recoveryRun = useRef(false);
+  const recoveryRun = useRef("");
   useEffect(() => {
-    if (!lifecycleLock || !connection || recoveryRun.current) return;
-    recoveryRun.current = true;
+    const recoveryKey = lifecycleLock ? `${lifecycleLock.id}:${publicKey?.toBase58() || "disconnected"}` : "";
+    if (!lifecycleLock || !connection || recoveryRun.current === recoveryKey) return;
+    recoveryRun.current = recoveryKey;
     let cancelled = false;
     (async () => {
       try {
@@ -643,9 +644,14 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
             const status = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
             const account = lifecycleLock.poolId ? await connection.getAccountInfo(new PublicKey(lifecycleLock.poolId), "confirmed") : null;
             setLifecycleVerification({ signature, status: status.value[0] || null, poolAccountExists: Boolean(account), checked: true });
-            if (status.value[0]?.err) markOperationOutcome("failed_submitted", { signature, reason: "Recorded transaction failed on-chain." });
-            else if (status.value[0]?.confirmationStatus === "finalized") markOperationOutcome("confirmed", { signature });
-            else notify("Transaction remains unconfirmed or unknown. The lock remains active.", "info");
+            if (status.value[0]?.err) {
+              markOperationOutcome("failed_submitted", { signature, reason: "Recorded transaction failed on-chain." });
+              notify("The recorded transaction failed on-chain. The token remains locked while BALNEX checks the current pool state.", "info");
+            } else if (status.value[0]?.confirmationStatus === "finalized") {
+              notify("Signature is finalized. BALNEX still requires independent mint/pool/LP verification before changing the lifecycle state.", "info");
+            } else {
+              notify("Transaction remains unconfirmed or unknown. The lock remains active.", "info");
+            }
           } catch (verifyError) {
             markOperationOutcome("unknown", { signature, reason: verifyError?.message || "RPC verification unavailable." });
             notify("RPC verification failed. BALNEX kept the global lock.", "error");
