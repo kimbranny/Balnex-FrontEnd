@@ -100,6 +100,10 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
     const recoveryKey = lifecycleLock ? `${lifecycleLock.id}:${publicKey?.toBase58() || "disconnected"}` : "";
     if (!lifecycleLock || !connection || recoveryRun.current === recoveryKey) return;
     recoveryRun.current = recoveryKey;
+    if (lifecycleLock.cluster !== CLUSTER) {
+      setLifecycleVerification({ outcome: "network_mismatch", expectedCluster: lifecycleLock.cluster, currentCluster: CLUSTER });
+      return;
+    }
     let cancelled = false;
     (async () => {
       try {
@@ -677,10 +681,11 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   const managingVerified = managingRecord ? verifiedMap[managingRecord.poolId] : null;
   const showForm = Boolean(
     lifecycleLock &&
+    lifecycleLock.cluster === CLUSTER &&
     ["TOKEN_CREATED", "POOL_PENDING"].includes(lifecycleLock.status) &&
     !records.some((record) => record.mint === lifecycleLock.mint)
   );
-  const isLockedToken = Boolean(lifecycleLock && selected?.mint === lifecycleLock.mint);
+  const isLockedToken = Boolean(lifecycleLock && lifecycleLock.cluster === CLUSTER && selected?.mint === lifecycleLock.mint);
 
   return (
     <section className="panel">
@@ -698,6 +703,13 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
       </div>
 
       {launch && <LaunchCard launch={launch} onContinue={() => setSelectedMint(launch.mint)} />}
+      {lifecycleLock && lifecycleLock.cluster !== CLUSTER && (
+        <div className="notice notice-error" role="alert">
+          <div><strong>Lifecycle locked on {String(lifecycleLock.cluster).toUpperCase()}</strong>
+            <p>This token was reserved on {lifecycleLock.cluster}. BALNEX will not create or withdraw liquidity on {CLUSTER} for this mint. Switch back to the original network to resume.</p>
+          </div>
+        </div>
+      )}
       {lifecycleLock?.recovery && (
         <div className="notice notice-error" role="alert">
           <div><strong>Recovery required — {lifecycleLock.operation?.type || "transaction"}</strong>
