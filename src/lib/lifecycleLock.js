@@ -208,6 +208,7 @@ export function beginLifecycleOperation({ mint, type, allowedStates, pendingStat
       const nextStatus = unknown ? "RECOVERY_REQUIRED"
         : state === "failed_no_submission" && type === "pool_create" ? "TOKEN_CREATED"
           : state === "failed_no_submission" && type === "remove_liquidity" ? "POOL_RUNNING"
+          : state === "failed_no_submission" && type === "token_create" ? "TOKEN_RESERVED"
             : state === "failed_submitted" && type === "pool_create" ? "TOKEN_CREATED"
               : state === "failed_submitted" && type === "remove_liquidity" ? "POOL_RUNNING"
                 : state === "confirmed" && type === "pool_create" ? "POOL_RUNNING"
@@ -306,7 +307,8 @@ export function markOperationOutcome(state, details = {}) {
   const nextStatus = unknown ? "RECOVERY_REQUIRED"
     : ["failed_no_submission", "failed_submitted"].includes(state) && current.operation?.type === "pool_create" ? "TOKEN_CREATED"
       : ["failed_no_submission", "failed_submitted"].includes(state) && current.operation?.type === "remove_liquidity" ? "POOL_RUNNING"
-        : state === "confirmed" && current.operation?.type === "pool_create" ? "POOL_RUNNING"
+        : state === "failed_no_submission" && current.operation?.type === "token_create" ? "TOKEN_RESERVED"
+          : state === "confirmed" && current.operation?.type === "pool_create" ? "POOL_RUNNING"
           : state === "confirmed" && current.operation?.type === "add_liquidity" ? "POOL_RUNNING"
             : state === "confirmed" && current.operation?.type === "remove_liquidity" ? "REMOVAL_PENDING"
               : current.status;
