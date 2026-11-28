@@ -697,11 +697,56 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
         </div>
       )}
 
-      {lifecycleLock?.operation?.state === "unknown" && (
+      {["unknown", "submitted"].includes(lifecycleLock?.operation?.state) && (
         <button type="button" className="secondary-button" disabled={busy} onClick={async () => {
           const signature = lifecycleLock.operation?.signature || lifecycleLock.recovery?.signature;
-          if (!signature) { notify("No transaction signature is recorded; RPC verification is required before retry.", "error"); return; }
           try {
+            if (!signature) {
+              const lastValid = lifecycleLock.operation?.lastValidBlockHeight;
+              if (!Number.isFinite(lastValid)) {
+                notify("No signature or blockhash expiry record is available. The lifecycle remains locked for manual RPC investigation.", "error");
+                return;
+              }
+              const height = await connection.getBlockHeight("confirmed");
+              if (height <= lastValid) {
+                notify("The transaction blockhash is still valid. BALNEX will not permit a retry yet.", "info");
+                return;
+              }
+              if (lifecycleLock.operation?.type === "token_create") {
+                const mintAccount = await connection.getAccountInfo(new PublicKey(lifecycleLock.mint), "confirmed");
+                if (!mintAccount) {
+                  markOperationOutcome("failed_no_submission", { reason: "Blockhash expired and the reserved mint account does not exist." });
+                  notify("No token transaction landed. Safe token creation retry is now available.", "success");
+                  return;
+                }
+              }
+              if (lifecycleLock.operation?.type === "pool_create" && lifecycleLock.poolId) {
+                const poolAccount = await connection.getAccountInfo(new PublicKey(lifecycleLock.poolId), "confirmed");
+                if (!poolAccount) {
+                  markOperationOutcome("failed_no_submission", { reason: "Blockhash expired and the derived pool account does not exist." });
+                  notify("No pool transaction landed. Safe pool creation retry is now available.", "success");
+                  return;
+                }
+              }
+              if (lifecycleLock.operation?.type === "remove_liquidity" && lifecycleLock.poolId && publicKey?.toBase58() === lifecycleLock.wallet) {
+                const record = loadPoolRecords().find((item) => item.mint === lifecycleLock.mint && item.poolId === lifecycleLock.poolId);
+                if (record) {
+                  const currentPosition = await verifyOne(record);
+                  const before = lifecycleLock.operation.lpBalanceBefore;
+                  const reservesBefore = lifecycleLock.operation.reservesBefore;
+                  if (currentPosition.status === "verified" && before !== undefined &&
+                      currentPosition.lpRaw.toString() === String(before) &&
+                      Number(currentPosition.reserves.token) === Number(reservesBefore?.token) &&
+                      Number(currentPosition.reserves.sol) === Number(reservesBefore?.sol)) {
+                    markOperationOutcome("failed_no_submission", { reason: "Blockhash expired and verified LP balance and pool reserves are unchanged." });
+                    notify("No liquidity removal landed. Safe retry is now available.", "success");
+                    return;
+                  }
+                }
+              }
+              notify("The blockhash expired, but on-chain state does not prove a safe retry. The lock remains in recovery.", "error");
+              return;
+            }
             const status = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
             const account = lifecycleLock.poolId ? await connection.getAccountInfo(new PublicKey(lifecycleLock.poolId), "confirmed") : null;
             setLifecycleVerification({ signature, status: status.value[0] || null, poolAccountExists: Boolean(account), checked: true });
