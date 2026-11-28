@@ -424,11 +424,21 @@ export default function App() {
       transaction.partialSign(mintKeypair);
 
       // Ask Phantom to approve and sign the transaction.
+      lifecycleOperation.update("signing", {
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+      });
       const signedTransaction = await signTransaction(transaction);
       walletSigned = true;
       lifecycleOperation.update("signed");
 
-      // Submit the signed transaction to the configured Solana network.
+      // Persist submission intent BEFORE the RPC call. If the tab closes while the RPC
+      // response is in flight, startup recovery must not offer a blind retry.
+      lifecycleOperation.update("submitted", {
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
+        reason: "Token transaction submission is in progress; signature not returned yet.",
+      });
       const signature = await connection.sendRawTransaction(signedTransaction.serialize(), {
         skipPreflight: false,
         preflightCommitment: "confirmed",
