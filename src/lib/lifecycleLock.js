@@ -144,7 +144,7 @@ export function reserveTokenLifecycle({ wallet, mint, name, symbol, decimals, su
 
 export function replaceReservedMint(mint, expectedName, expectedSymbol) {
   const current = getLifecycleLock();
-  if (!current || current.status !== "TOKEN_RESERVED" || current.operation?.state !== "failed_no_submission" ||
+  if (!current || current.cluster !== CLUSTER || current.status !== "TOKEN_RESERVED" || current.operation?.state !== "failed_no_submission" ||
       current.name !== expectedName || current.symbol !== expectedSymbol) {
     throw new Error("This reserved token cannot be replaced safely. Verify the existing lifecycle before retrying.");
   }
@@ -158,7 +158,7 @@ export function replaceReservedMint(mint, expectedName, expectedSymbol) {
 
 export function updateLifecycleLock(patch, expectedId) {
   const current = getLifecycleLock();
-  if (!current || (expectedId && current.id !== expectedId)) {
+  if (!current || current.cluster !== CLUSTER || (expectedId && current.id !== expectedId)) {
     throw new Error("The global BALNEX lifecycle lock changed. Refresh and verify its status.");
   }
   const next = { ...current, ...patch, updatedAt: Date.now() };
