@@ -360,7 +360,7 @@ export function markLiquidityRemoved(_wallet, mint, removalSignature, extra = {}
 
 // Legacy reads retained for existing components. The lifecycle lock itself is global,
 // not scoped to the currently connected wallet.
-export function getActiveLaunch(wallet) {
+export function getActiveLaunch(_wallet) {
   const lock = getLifecycleLock();
   if (!lock) return null;
   return { ...lock, status: LEGACY_STATUS(lock.status), lifecycleStatus: lock.status, signature: lock.transactions?.tokenCreation };
