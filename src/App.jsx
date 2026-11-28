@@ -11,6 +11,7 @@ import {
   createSetAuthorityInstruction,
   getAssociatedTokenAddressSync,
   getMinimumBalanceForRentExemptMint,
+  getMint,
   MINT_SIZE,
   TOKEN_PROGRAM_ID,
 } from "@solana/spl-token";
@@ -458,6 +459,13 @@ export default function App() {
 
       if (confirmation.value.err) {
         throw new Error("The Solana transaction failed. No successful token creation was confirmed.");
+      }
+
+      // Independently verify the finalized SPL mint and its issued supply before advancing
+      // the lifecycle or enabling the liquidity workflow.
+      const confirmedMint = await getMint(connection, mintKeypair.publicKey, "finalized", TOKEN_PROGRAM_ID);
+      if (confirmedMint.decimals !== tokenDecimals || confirmedMint.supply !== baseUnits) {
+        throw new Error("The transaction finalized, but the on-chain mint decimals or supply do not match the token configuration.");
       }
 
       const token = {
