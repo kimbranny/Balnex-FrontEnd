@@ -36,7 +36,7 @@ test("global lifecycle blocks a second token and persists across reads", () => {
   assert.throws(() => lifecycle.reserveTokenLifecycle({
     wallet, mint: mintB, name: "Token B", symbol: "B", decimals: 9, supply: "1",
   }), /locked to Token A/i);
-  assert.equal(JSON.parse(localStorage.getItem("balnex:lifecycle-lock:v1:devnet")).id, lock.id);
+  assert.equal(JSON.parse(localStorage.getItem("balnex:lifecycle-lock:v1")).id, lock.id);
 });
 
 
