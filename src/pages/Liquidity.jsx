@@ -720,11 +720,24 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
                 return;
               }
               if (lifecycleLock.operation?.type === "token_create") {
-                const mintAccount = await connection.getAccountInfo(new PublicKey(lifecycleLock.mint), "confirmed");
+                const mintKey = new PublicKey(lifecycleLock.mint);
+                const mintAccount = await connection.getAccountInfo(mintKey, "confirmed");
                 if (!mintAccount) {
                   markOperationOutcome("failed_no_submission", { reason: "Blockhash expired and the reserved mint account does not exist." });
                   notify("No token transaction landed. Safe token creation retry is now available.", "success");
                   return;
+                }
+                if (mintAccount.owner.equals(TOKEN_PROGRAM_ID)) {
+                  const parsedMint = await getMint(connection, mintKey, "confirmed", TOKEN_PROGRAM_ID);
+                  const expectedSupply = BigInt(lifecycleLock.supply) * 10n ** BigInt(Number(lifecycleLock.decimals));
+                  if (parsedMint.decimals === Number(lifecycleLock.decimals) && parsedMint.supply === expectedSupply) {
+                    markTokenCreated({
+                      wallet: lifecycleLock.wallet, mint: lifecycleLock.mint, name: lifecycleLock.name,
+                      symbol: lifecycleLock.symbol, decimals: parsedMint.decimals, supply: lifecycleLock.supply,
+                    });
+                    notify("The reserved SPL mint and supply are verified on-chain. Continue to liquidity.", "success");
+                    return;
+                  }
                 }
               }
               if (lifecycleLock.operation?.type === "pool_create" && lifecycleLock.poolId) {
@@ -733,6 +746,20 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
                   markOperationOutcome("failed_no_submission", { reason: "Blockhash expired and the derived pool account does not exist." });
                   notify("No pool transaction landed. Safe pool creation retry is now available.", "success");
                   return;
+                }
+                if (publicKey?.toBase58() === lifecycleLock.wallet) {
+                  const record = loadPoolRecords().find((item) => item.mint === lifecycleLock.mint && item.poolId === lifecycleLock.poolId) || {
+                    poolId: lifecycleLock.poolId, owner: lifecycleLock.wallet, cluster: CLUSTER,
+                    mint: lifecycleLock.mint, name: lifecycleLock.name, symbol: lifecycleLock.symbol,
+                  };
+                  const verifiedPool = await verifyOne(record);
+                  if (verifiedPool.status === "verified") {
+                    savePoolRecord({ ...record, lpMint: verifiedPool.lpMint });
+                    markLiquidityCreated(lifecycleLock.wallet, lifecycleLock.mint, { poolId: lifecycleLock.poolId, lpMint: verifiedPool.lpMint });
+                    setRecordsVersion((v) => v + 1);
+                    notify("The CPMM pool and token pair are independently verified on-chain.", "success");
+                    return;
+                  }
                 }
               }
               if (lifecycleLock.operation?.type === "remove_liquidity" && lifecycleLock.poolId && publicKey?.toBase58() === lifecycleLock.wallet) {
