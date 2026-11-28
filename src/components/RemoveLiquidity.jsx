@@ -131,7 +131,12 @@ export default function RemoveLiquidity({
       setPercent("");
       notify("Liquidity withdrawn and verified on-chain.", "success");
       setStage("Refreshing your position…");
-      await onChanged(signature);
+      try {
+        await onChanged(signature);
+      } catch (refreshError) {
+        console.warn("[BALNEX] withdrawal verified, but the UI refresh failed:", refreshError);
+        notify("Withdrawal is verified on-chain, but the position display could not refresh. Reopen this pool to reload it.", "info");
+      }
     } catch (err) {
       setFailure(toFailure(err));
       notify("Withdrawal did not complete. See details below.", "error");
