@@ -8,7 +8,7 @@ import { CLUSTER, WSOL_MINT } from "../config";
 import Diagnostics from "../components/Diagnostics";
 import LaunchCard from "../components/LaunchCard";
 import PoolPanel from "../components/PoolPanel";
-import { beginLifecycleOperation, getLifecycleLock, markLiquidityCreated, markLiquidityRemoved, markOperationOutcome, markRemovalVerified, setLifecycleVerification, useActiveLaunch, useLifecycleLock } from "../lib/launch";
+import { beginLifecycleOperation, getLifecycleLock, markLiquidityCreated, markLiquidityRemoved, markOperationOutcome, markRemovalVerified, setLifecycleVerification, updateLifecycleLock, useActiveLaunch, useLifecycleLock } from "../lib/launch";
 import RemoveLiquidity from "../components/RemoveLiquidity";
 import { deletePoolRecord, loadPoolRecords, savePoolRecord, verifyPool } from "../lib/pools";
 import { loadRaydium, prepareCreatePool, readMint } from "../lib/raydium";
@@ -43,6 +43,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   const notify = useToast();
 
   const [busy, setBusy] = useState(false);
+  const [verifyingExistingPool, setVerifyingExistingPool] = useState(false);
   const [error, setError] = useState("");
   const [errInfo, setErrInfo] = useState(null);
   const [diag, setDiag] = useState(null);
@@ -407,6 +408,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
       });
     }
     if (prepared.poolId) {
+      updateLifecycleLock({ poolId: prepared.poolId }, currentLock.id);
       const existing = await connection.getAccountInfo(new PublicKey(prepared.poolId), "confirmed");
       if (existing) {
         throw new StageError("prepare", existing.owner.toBase58() === prepared.programId
@@ -467,6 +469,55 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
       cost: { deposit, poolFee, rent, networkFee, total, balance },
       simLogs: sim.logs,
     };
+  }
+
+  async function handleVerifyExistingPool() {
+    if (verifyingExistingPool) return;
+    const lock = getLifecycleLock();
+    const poolId = diag?.inspection?.poolId || lock?.poolId;
+    if (!lock || lock.cluster !== CLUSTER || lock.mint !== selected?.mint || !poolId ||
+        publicKey?.toBase58() !== lock.wallet) {
+      notify("Reconnect the wallet that owns the locked token and verify the pool on its original network.", "error");
+      return;
+    }
+    setVerifyingExistingPool(true);
+    try {
+      const record = {
+        poolId,
+        owner: lock.wallet,
+        cluster: CLUSTER,
+        mint: lock.mint,
+        name: lock.name,
+        symbol: lock.symbol,
+        signature: lock.transactions?.poolCreation || null,
+      };
+      const result = await verifyPool({
+        connection,
+        owner: publicKey,
+        record,
+        getRaydium: () => loadRaydium({ connection, publicKey, signAllTransactions }),
+      });
+      if (result.status !== "verified") {
+        throw new Error(result.message || "The existing address could not be verified as an active Raydium CPMM token/SOL pool.");
+      }
+      savePoolRecord({ ...record, lpMint: result.lpMint });
+      markLiquidityCreated(lock.wallet, lock.mint, {
+        poolId,
+        lpMint: result.lpMint,
+        creationSignature: record.signature || undefined,
+      });
+      setRecordsVersion((version) => version + 1);
+      setManaging("");
+      setPlan(null);
+      setError("");
+      setErrInfo(null);
+      setDiag(null);
+      notify("Existing Raydium CPMM pool verified. BALNEX has resumed the locked token lifecycle.", "success");
+    } catch (verifyError) {
+      notify(verifyError?.message || "Pool verification failed. The lifecycle remains locked.", "error");
+    } finally {
+      setVerifyingExistingPool(false);
+    }
   }
 
   async function handleReviewPool() {
@@ -912,6 +963,11 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
               </p>
             )}
             <Diagnostics data={diag} />
+            {diag?.inspection?.poolId && lifecycleLock?.cluster === CLUSTER && lifecycleLock?.mint === selected?.mint && (
+              <button type="button" className="secondary-button" disabled={verifyingExistingPool || busy} onClick={handleVerifyExistingPool}>
+                {verifyingExistingPool ? "Verifying existing pool…" : "VERIFY EXISTING POOL"}
+              </button>
+            )}
             {errInfo?.title === "Wallet signing failed" && (
               <button type="button" className="text-button" onClick={handleWalletSelfTest}>
                 Test whether my wallet can sign at all (nothing is sent)
