@@ -23,6 +23,29 @@ export const messageOf = (tx) => (isVersioned(tx) ? tx.message : tx.compileMessa
 // only exists for VersionedTransaction.
 export const toSimulatable = (tx) => (isVersioned(tx) ? tx : new VersionedTransaction(tx.compileMessage()));
 
+const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function encodeBase58(bytes) {
+  if (!bytes || !bytes.length) return null;
+  let value = 0n;
+  for (const byte of bytes) value = (value << 8n) + BigInt(byte);
+  let encoded = "";
+  while (value > 0n) {
+    const remainder = Number(value % 58n);
+    encoded = BASE58_ALPHABET[remainder] + encoded;
+    value /= 58n;
+  }
+  let leadingZeroes = 0;
+  while (leadingZeroes < bytes.length && bytes[leadingZeroes] === 0) leadingZeroes += 1;
+  return "1".repeat(leadingZeroes) + (encoded || (leadingZeroes ? "" : "1"));
+}
+
+export function signatureFromSignedTransaction(transaction) {
+  const signature = isVersioned(transaction)
+    ? transaction.signatures?.[0]
+    : transaction.signatures?.[0]?.signature || transaction.signature;
+  return signature ? encodeBase58(signature) : null;
+}
+
 export const STAGES = {
   prepare: "Preparing",
   simulation: "Simulation",
@@ -432,9 +455,9 @@ async function fetchFailureDetails(connection, signature) {
 
 // Sign with the wallet, submit with preflight, then wait for a real confirmation.
 // Throws StageError for every failure; resolves only when the transaction confirmed.
-export async function signSendConfirm({ connection, transaction, signTransaction, sendTransaction, onStage, onSubmitted, context = {} }) {
+export async function signSendConfirm({ connection, transaction, signTransaction, sendTransaction, onStage, onSigned, onSubmitted, context = {} }) {
   try {
-    return await signSendConfirmInner({ connection, transaction, signTransaction, sendTransaction, onStage, onSubmitted });
+    return await signSendConfirmInner({ connection, transaction, signTransaction, sendTransaction, onStage, onSigned, onSubmitted });
   } catch (err) {
     if (err instanceof StageError) err.details = { ...context, ...err.details };
     throw err;
@@ -457,7 +480,7 @@ const attemptRecord = (method, err) => ({
   message: err?.error?.message || err?.message || null,
 });
 
-async function signSendConfirmInner({ connection, transaction, signTransaction, sendTransaction, onStage, onSubmitted }) {
+async function signSendConfirmInner({ connection, transaction, signTransaction, sendTransaction, onStage, onSigned, onSubmitted }) {
   if (typeof signTransaction !== "function" && typeof sendTransaction !== "function") {
     throw new StageError("signing", "Your wallet can't sign transactions. Reconnect Phantom and try again.", {
       submitted: false,
@@ -475,6 +498,11 @@ async function signSendConfirmInner({ connection, transaction, signTransaction, 
     let signed;
     try {
       signed = await signTransaction(transaction);
+      const signedSignature = signatureFromSignedTransaction(signed);
+      if (signedSignature) {
+        try { onSigned?.(signedSignature, blockhash); }
+        catch (hookErr) { console.warn("onSigned hook failed:", hookErr); }
+      }
     } catch (err) {
       console.error("Wallet signTransaction error:", err);
       attempts.push(attemptRecord("signTransaction", err));
