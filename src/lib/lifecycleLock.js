@@ -142,10 +142,15 @@ export function reserveTokenLifecycle({ wallet, mint, name, symbol, decimals, su
 export function replaceReservedMint(mint, expectedName, expectedSymbol) {
   const current = getLifecycleLock();
   if (!current || current.status !== "TOKEN_RESERVED" || current.operation?.state !== "failed_no_submission" ||
-      current.transactions?.tokenCreation || current.name !== expectedName || current.symbol !== expectedSymbol) {
+      current.name !== expectedName || current.symbol !== expectedSymbol) {
     throw new Error("This reserved token cannot be replaced safely. Verify the existing lifecycle before retrying.");
   }
-  return updateLifecycleLock({ mint, recovery: null, operation: { type: "token_create", state: "prepared", startedAt: Date.now(), updatedAt: Date.now() } }, current.id);
+  return updateLifecycleLock({
+    mint,
+    transactions: { ...current.transactions, tokenCreation: null },
+    recovery: null,
+    operation: { type: "token_create", state: "prepared", startedAt: Date.now(), updatedAt: Date.now(), signature: null },
+  }, current.id);
 }
 
 export function updateLifecycleLock(patch, expectedId) {
