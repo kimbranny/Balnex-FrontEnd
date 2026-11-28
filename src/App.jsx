@@ -647,6 +647,7 @@ export default function App() {
             <strong>LIQUIDITY WORKFLOW LOCKED</strong>
             <span>Token: {lifecycleLock.name || "Unnamed"} ({lifecycleLock.symbol || "—"})</span>
             <span>Status: {lifecycleLock.status.replaceAll("_", " ")}</span>
+            <span>Network: {String(lifecycleLock.cluster || CLUSTER).toUpperCase()}</span>
             <small>You must complete or resolve this token's liquidity lifecycle before creating another token.</small>
           </div>
           <button type="button" className="primary" onClick={() => {
