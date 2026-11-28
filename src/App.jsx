@@ -426,6 +426,11 @@ export default function App() {
       // Sign the new mint account with its generated keypair.
       transaction.partialSign(mintKeypair);
 
+      const blockhashCheck = await connection.isBlockhashValid(latestBlockhash.blockhash, { commitment: "confirmed" });
+      if (!blockhashCheck.value) {
+        throw new Error("The token creation blockhash expired before signing. Retry to rebuild the transaction with a fresh blockhash.");
+      }
+
       // Ask Phantom to approve and sign the transaction.
       lifecycleOperation.update("signing", {
         blockhash: latestBlockhash.blockhash,
@@ -434,7 +439,7 @@ export default function App() {
       const signedTransaction = await signTransaction(transaction);
       walletSigned = true;
       signedSignature = signatureFromSignedTransaction(signedTransaction);
-      lifecycleOperation.update("signed", { ...(signedSignature ? { signature: signedSignature } : {}) });
+      lifecycleOperation.update("signed", { signature: signedSignature || null });
 
       // Persist submission intent BEFORE the RPC call. If the tab closes while the RPC
       // response is in flight, startup recovery must not offer a blind retry.
