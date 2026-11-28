@@ -28,6 +28,11 @@ test("global lifecycle blocks a second token and persists across reads", () => {
   localStorage.clear();
   const lock = reserve();
   assert.equal(lifecycle.getLifecycleLock().mint, mintA);
+  // The lock is global across wallet changes/disconnects, not wallet-scoped.
+  assert.equal(lifecycle.getActiveLaunch("different-wallet").mint, mintA);
+  lifecycle.markTokenCreated({ wallet, mint: mintA, name: "Token A", symbol: "A" });
+  lifecycle.markLiquidityCreated(wallet, mintA, { poolId: pool });
+  assert.equal(lifecycle.getLifecycleLock().status, "POOL_RUNNING");
   assert.throws(() => lifecycle.reserveTokenLifecycle({
     wallet, mint: mintB, name: "Token B", symbol: "B", decimals: 9, supply: "1",
   }), /locked to Token A/i);
@@ -85,6 +90,35 @@ test("verified finalized removal with zero LP and reserves is the only unlock pa
     reserves: { token: 0, sol: 0 },
   });
   assert.equal(lifecycle.getLifecycleLock(), null);
+});
+
+
+test("token creation operation guard blocks a second concurrent token request", () => {
+  localStorage.clear();
+  reserve();
+  const first = lifecycle.beginLifecycleOperation({
+    mint: mintA, type: "token_create", allowedStates: ["TOKEN_RESERVED"], pendingStatus: "TOKEN_RESERVED",
+  });
+  assert.throws(() => lifecycle.beginLifecycleOperation({
+    mint: mintA, type: "token_create", allowedStates: ["TOKEN_RESERVED"], pendingStatus: "TOKEN_RESERVED",
+  }), /already running/i);
+  first.update("failed_no_submission", { reason: "Phantom rejected before submission" });
+  first.release();
+  assert.equal(lifecycle.getLifecycleLock().status, "TOKEN_RESERVED");
+});
+
+test("failed removal keeps the token locked and restores only a safe retry state", () => {
+  localStorage.clear();
+  reserve();
+  lifecycle.markTokenCreated({ wallet, mint: mintA, name: "Token A", symbol: "A" });
+  lifecycle.markLiquidityCreated(wallet, mintA, { poolId: pool });
+  const removal = lifecycle.beginLifecycleOperation({
+    mint: mintA, type: "remove_liquidity", allowedStates: ["POOL_RUNNING"], pendingStatus: "REMOVAL_PENDING",
+  });
+  removal.update("failed_no_submission", { reason: "Phantom signing rejected" });
+  removal.release();
+  assert.equal(lifecycle.getLifecycleLock().status, "POOL_RUNNING");
+  assert.equal(lifecycle.getLifecycleLock().mint, mintA);
 });
 
 test("social links validate, persist by mint, isolate, and clear", () => {
