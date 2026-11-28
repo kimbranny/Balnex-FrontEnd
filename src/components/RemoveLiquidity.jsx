@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { prepareRemoveLiquidity } from "../lib/raydium";
-import { signSendConfirm, simulateWithCost, toFailure } from "../lib/txRunner";
+import { beginRemoveLiquidity, checkAllowed, OP } from "../lib/lifecycleLock";
+import { describeError, messageOf, signSendConfirm, simulateWithCost, toFailure } from "../lib/txRunner";
+import { useLifecycleLock, useVerifyLifecycle } from "../lib/useLifecycleLock";
 import { explorerTx, fromRawUnits, shorten } from "../lib/utils";
 import Diagnostics from "./Diagnostics";
 
@@ -27,6 +29,9 @@ export default function RemoveLiquidity({
   const [stage, setStage] = useState("");
   const [failure, setFailure] = useState(null);
   const [done, setDone] = useState(null);
+  useLifecycleLock(); // re-render when the lock changes
+  const { verify: verifyLock } = useVerifyLifecycle();
+  const gate = checkAllowed(OP.REMOVE_LIQUIDITY, record.mint);
 
   const lpRaw = verified.lpRaw;
   const hasLp = lpRaw > 0n;
@@ -38,6 +43,15 @@ export default function RemoveLiquidity({
 
   async function handleWithdraw() {
     if (burn <= 0n) return;
+    // Action-level guard (synchronous): lock must exist for THIS token, the state must allow
+    // removal, and no other operation may be running (double-click safe).
+    const begun = beginRemoveLiquidity(record.mint, {});
+    if (!begun.ok) {
+      notify(begun.message, "error");
+      return;
+    }
+    const op = begun.handle;
+    let confirmedOnChain = false;
     setFailure(null);
     setDone(null);
     setBusy(true);
@@ -62,13 +76,20 @@ export default function RemoveLiquidity({
         submitting: "Sending…",
         confirming: "Waiting for confirmation…",
       };
+      op.signing(messageOf(tx).recentBlockhash);
       const { signature } = await signSendConfirm({
         connection,
         transaction: tx,
         signTransaction,
         sendTransaction,
-        onStage: (name) => setStage(labels[name] || ""),
+        onStage: (name) => {
+          if (name === "signing-alt") op.markMaybeSubmitted();
+          setStage(labels[name] || "");
+        },
+        onSubmitted: (sig, blockhash) => op.submitted({ signature: sig, blockhash }),
       });
+      op.confirmed({ signature }); // transaction confirmed; the lock stays until verified on-chain
+      confirmedOnChain = true;
 
       setDone({ signature, percent });
       setPercent("");
@@ -78,7 +99,13 @@ export default function RemoveLiquidity({
     } catch (err) {
       setFailure(toFailure(err));
       notify("Withdrawal did not complete. See details below.", "error");
+      if (!confirmedOnChain) {
+        const d = describeError(err);
+        op.failed({ submitted: d.submitted, signature: d.signature, message: d.message, stage: d.stage });
+        verifyLock(); // re-check pool + position before any retry is offered
+      }
     } finally {
+      op.end();
       setBusy(false);
       setStage("");
     }
@@ -206,7 +233,16 @@ export default function RemoveLiquidity({
             tolerance. Wrapped SOL from the pool is returned to you as SOL.
           </small>
 
-          <button type="button" className="danger-button" disabled={busy || burn <= 0n} onClick={handleWithdraw}>
+          {!gate.ok && (
+            <div className="notice" role="status">
+              <span className="notice-icon">ⓘ</span>
+              <div>
+                <strong>Removal not available right now</strong>
+                <p>{gate.message} Use VERIFY STATUS in the banner above if the status is unknown.</p>
+              </div>
+            </div>
+          )}
+          <button type="button" className="danger-button" disabled={busy || burn <= 0n || !gate.ok} onClick={handleWithdraw}>
             <span aria-hidden="true">⊖</span> {busy ? stage || "Working…" : percent ? `Confirm: remove ${percent}%` : "Choose an amount"}
           </button>
         </>

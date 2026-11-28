@@ -8,6 +8,8 @@ import Diagnostics from "../components/Diagnostics";
 import LaunchCard from "../components/LaunchCard";
 import PoolPanel from "../components/PoolPanel";
 import { markLiquidityCreated, markLiquidityRemoved, useActiveLaunch } from "../lib/launch";
+import { beginCreatePool, checkAllowed, OP } from "../lib/lifecycleLock";
+import { useLifecycleLock, useVerifyLifecycle } from "../lib/useLifecycleLock";
 import RemoveLiquidity from "../components/RemoveLiquidity";
 import { deletePoolRecord, loadPoolRecords, savePoolRecord, verifyPool } from "../lib/pools";
 import { loadRaydium, prepareCreatePool, readMint } from "../lib/raydium";
@@ -15,6 +17,7 @@ import {
   StageError,
   describeError,
   inspectTransaction,
+  messageOf,
   rebuildWithoutLookupTables,
   signSendConfirm,
   simulateWithCost,
@@ -67,6 +70,14 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   const [showCreate, setShowCreate] = useState(false);
   const verifyRun = useRef(0);
   const launch = useActiveLaunch(owner);
+  const { lock } = useLifecycleLock();
+  const { verify: verifyLock } = useVerifyLifecycle();
+
+  // Returning to this page re-checks the lock against the chain (never unlocks without proof).
+  useEffect(() => {
+    verifyLock();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Lifecycle sync from CHAIN-verified pool data. Creating a pool moves the launch to
   // liquidity_created but keeps the wallet locked; a pool that is verifiably drained on-chain
@@ -89,9 +100,13 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
     }
   }, [launch, records, verifiedMap]);
 
+  // While a lifecycle is locked, ONLY the locked token can be pooled.
   const usable = useMemo(
-    () => walletTokens.tokens.filter((token) => token.raw > 0n && token.mint !== WSOL_MINT),
-    [walletTokens.tokens]
+    () =>
+      walletTokens.tokens.filter(
+        (token) => token.raw > 0n && token.mint !== WSOL_MINT && (!lock?.mint || token.mint === lock.mint)
+      ),
+    [walletTokens.tokens, lock?.mint]
   );
   const selected = usable.find((token) => token.mint === selectedMint) || null;
 
@@ -156,10 +171,12 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   // shows this wallet holds no LP tokens for the pool (a full removal). Partial removals keep
   // the lock because liquidity is still in the pool.
   async function handleWithdrawn(record, signature) {
+    // The global lock is released ONLY by this on-chain re-check (confirmed removal + pool state +
+    // the lock owner's LP position read back from the chain).
+    const verdict = await verifyLock();
     const result = await refreshPool(record);
-    const closed = (result.status === "verified" || result.status === "emptied") && result.lpRaw === 0n;
-    if (!closed) {
-      notify("Withdrawal confirmed. Some liquidity remains, so your launch stays active until all of it is removed.", "info");
+    if (!(verdict?.ok && verdict.status === "RESOLVED")) {
+      notify("Withdrawal confirmed. Your token stays locked until the removal is verified on-chain and no liquidity remains.", "info");
       return;
     }
     savePoolRecord({ ...record, removalSignature: signature, removedAt: Date.now() });
@@ -284,6 +301,11 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
       setError("Choose a token from your wallet first.");
       return;
     }
+    const allowed = checkAllowed(OP.CREATE_POOL, selected.mint);
+    if (!allowed.ok && allowed.code !== "NO_LOCK") {
+      setError(allowed.message);
+      return;
+    }
 
     setBusy(true);
     setStage("Checking your token and simulating the pool…");
@@ -302,6 +324,22 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
   async function handleConfirmPool() {
     if (!plan) return;
     clearFailure();
+
+    // Action-level guard (synchronous, before any await): re-reads the global lock, checks the
+    // token matches and the state allows pool creation, and takes the in-process guard so a
+    // double-click can't start two pool creations. A token that isn't under a lock yet becomes
+    // THE locked lifecycle here (only if no other lifecycle is active).
+    const begun = beginCreatePool(selected.mint, {
+      expectedPoolId: plan.prepared.poolId,
+      adopt: { wallet: publicKey.toBase58(), name: selected.name || "", symbol: selected.symbol || "", decimals: plan.mintInfo.decimals },
+    });
+    if (!begun.ok) {
+      setError(begun.message);
+      notify(begun.message, "error");
+      return;
+    }
+    const op = begun.handle;
+    let confirmedLifecycle = false;
     setBusy(true);
 
     try {
@@ -311,11 +349,13 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
         active = await buildCreatePlan();
         if (active.cost.total > plan.cost.total * 1.02 + 10000) {
           setPlan(active);
+          op.setExpectedPool(active.prepared.poolId);
           throw new StageError("prepare", "The cost changed while you were reviewing. Check the updated total and confirm again.", {
             submitted: false,
           });
         }
         setPlan(active);
+        op.setExpectedPool(active.prepared.poolId);
       }
 
       if (BigInt(active.cost.balance) < BigInt(Math.ceil(active.cost.total)) + BUFFER_LAMPORTS) {
@@ -329,15 +369,23 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
         confirming: "Waiting for confirmation…",
       };
       labels["signing-alt"] = "Retrying with Phantom's sign-and-send…";
-      const run = (transaction, inspection, transactionFormat, notes) =>
-        signSendConfirm({
+      const run = (transaction, inspection, transactionFormat, notes) => {
+        op.signing(messageOf(transaction).recentBlockhash);
+        return signSendConfirm({
           connection,
           transaction,
           signTransaction,
           sendTransaction,
           context: { inspection, transactionFormat, fallbackNotes: notes },
-          onStage: (name) => setStage(labels[name] || ""),
+          // The wallet may submit by itself in the sign-and-send fallback.
+          onStage: (name) => {
+            if (name === "signing-alt") op.markMaybeSubmitted();
+            setStage(labels[name] || "");
+          },
+          // Recorded the moment a signature exists, before waiting for confirmation.
+          onSubmitted: (signature, blockhash) => op.submitted({ signature, blockhash }),
         });
+      };
 
       let signature;
       try {
@@ -395,6 +443,14 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
         createdAt: Date.now(),
       };
       savePoolRecord(record);
+      op.confirmed({
+        poolId: record.poolId,
+        lpMint: record.lpMint,
+        signature,
+        tokenDeposited: record.tokenDeposited,
+        solDeposited: record.solDeposited,
+      });
+      confirmedLifecycle = true;
       // Update the EXISTING launch record for this mint in place (no second record).
       // The wallet stays locked; only confirmed liquidity removal unlocks it.
       markLiquidityCreated(publicKey.toBase58(), selected.mint, {
@@ -412,7 +468,14 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
       walletTokens.refresh();
     } catch (err) {
       fail(err);
+      if (!confirmedLifecycle) {
+        const d = describeError(err);
+        // Keeps the lock. submitted === false => safe retry; anything else => verify on-chain first.
+        op.failed({ submitted: d.submitted, signature: d.signature, message: d.message, stage: d.stage });
+        verifyLock();
+      }
     } finally {
+      op.end();
       setBusy(false);
       setStage("");
     }
@@ -514,7 +577,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
             })
           )}
 
-          {!managingRecord && (
+          {!managingRecord && !lock && (
             <button type="button" className="secondary-button" onClick={() => setShowCreate((v) => !v)}>
               {showCreate ? "Hide pool creation" : "Launch another pool"}
             </button>

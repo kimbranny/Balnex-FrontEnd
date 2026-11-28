@@ -7,6 +7,9 @@ import Diagnostics from "../components/Diagnostics";
 import { useToast } from "../components/Toast";
 import { CLUSTER, WSOL_MINT } from "../config";
 import { TokenStats } from "../components/Analytics";
+import SocialLinks from "../components/SocialLinks";
+import { checkAllowed, OP } from "../lib/lifecycleLock";
+import { useLifecycleLock } from "../lib/useLifecycleLock";
 import { useLaunches } from "../lib/launch";
 import { loadPoolRecords } from "../lib/pools";
 import {
@@ -42,6 +45,7 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
   //  - anything left is de-duplicated by mint.
   const owner = publicKey ? publicKey.toBase58() : "";
   const launches = useLaunches(owner);
+  const { lock: lifecycleLock } = useLifecycleLock(); // also re-renders Create pool gating
   const poolRecords = useMemo(
     () => (owner ? loadPoolRecords().filter((r) => r.owner === owner) : []),
     [owner, launches]
@@ -547,6 +551,9 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
                 </>
               )}
 
+              {/* Optional social links: separate card, isolated from authorities. */}
+              {!token.historical && <SocialLinks key={token.mint} mint={token.mint} />}
+
               {(() => {
                 const launch = launches.find((l) => l.mint === token.mint);
                 if (!launch) return null;
@@ -619,7 +626,13 @@ export default function Manage({ walletTokens, onNavigate, onUseForLiquidity }) 
 
               {!token.historical && !launches.some((l) => l.mint === token.mint && (l.poolId || l.status === "completed")) && (
               <div className="token-actions">
-                <button type="button" className="secondary-button compact" onClick={() => onUseForLiquidity(token.mint)}>
+                <button
+                  type="button"
+                  className="secondary-button compact"
+                  disabled={!(checkAllowed(OP.CREATE_POOL, token.mint).ok || checkAllowed(OP.CREATE_POOL, token.mint).code === "NO_LOCK")}
+                  title={lifecycleLock && lifecycleLock.mint !== token.mint ? "Another token's liquidity lifecycle is locked." : undefined}
+                  onClick={() => onUseForLiquidity(token.mint)}
+                >
                   Create pool →
                 </button>
               </div>

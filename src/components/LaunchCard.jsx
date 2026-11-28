@@ -11,7 +11,7 @@ import Diagnostics from "./Diagnostics";
 import { useToast } from "./Toast";
 
 // Shown while the wallet has an unfinished launch: status, Continue, and Abandon.
-export default function LaunchCard({ launch, onContinue }) {
+export default function LaunchCard({ launch, onContinue, allowAbandon = false }) {
   const [open, setOpen] = useState(false);
   const label = launch.symbol ? `$${launch.symbol}` : shorten(launch.mint, 4, 4);
 
@@ -68,10 +68,16 @@ export default function LaunchCard({ launch, onContinue }) {
           {launch.status === "liquidity_created" ? "Manage Pool" : "Continue Current Launch"} <span>→</span>
         </button>
       )}
-      {launch.status === "launch_pending" && (
+      {launch.status === "launch_pending" && allowAbandon && (
         <button type="button" className="text-button danger-text" onClick={() => setOpen(true)}>
           Abandon This Launch
         </button>
+      )}
+      {launch.status === "launch_pending" && !allowAbandon && (
+        <small className="helper">
+          Abandoning is disabled while the global liquidity lock is active: the lock only releases after a verified
+          liquidity removal on-chain.
+        </small>
       )}
 
       {open && <AbandonDialog launch={launch} onClose={() => setOpen(false)} />}

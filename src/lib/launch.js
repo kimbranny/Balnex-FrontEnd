@@ -10,14 +10,11 @@
 //   liquidity_created pool + initial liquidity verified on-chain   (LOCKED)
 //   completed         liquidity fully removed, confirmed on-chain  (unlocked, kept as history)
 //   abandoned         user gave up before creating a pool          (unlocked, kept as history)
-import { useConnection } from "@solana/wallet-adapter-react";
-import { PublicKey } from "@solana/web3.js";
 import { useEffect, useMemo, useState } from "react";
 import { CLUSTER } from "../config";
 
 const KEY = `balnex:launches:v1:${CLUSTER}`;
 const EVENT = "balnex:launches-changed";
-const STALE_MINT_MS = 2 * 60 * 1000;
 
 const RANK = { launch_pending: 1, liquidity_created: 2, abandoned: 3, completed: 3 };
 
@@ -69,6 +66,15 @@ export function getActiveLaunch(wallet) {
   return (
     read()
       .filter((r) => r.wallet === wallet && (r.status === "launch_pending" || r.status === "liquidity_created"))
+      .sort((a, b) => b.createdAt - a.createdAt)[0] || null
+  );
+}
+
+// Any wallet's unfinished launch (used once at startup to adopt it into the global lock).
+export function getAnyActiveLaunch() {
+  return (
+    read()
+      .filter((r) => r.status === "launch_pending" || r.status === "liquidity_created")
       .sort((a, b) => b.createdAt - a.createdAt)[0] || null
   );
 }
@@ -151,7 +157,6 @@ export function useLaunches(wallet) {
 }
 
 export function useActiveLaunch(wallet) {
-  const { connection } = useConnection();
   const [version, setVersion] = useState(0);
 
   useEffect(() => {
@@ -166,25 +171,7 @@ export function useActiveLaunch(wallet) {
 
   const launch = useMemo(() => getActiveLaunch(wallet), [wallet, version]);
 
-  // Chain check: a pending launch whose mint definitively doesn't exist can't be continued.
-  // Only released if the record is old enough to rule out RPC lag; RPC errors keep the lock.
-  useEffect(() => {
-    if (!launch || launch.status !== "launch_pending") return undefined;
-    let cancelled = false;
-    (async () => {
-      try {
-        const info = await connection.getAccountInfo(new PublicKey(launch.mint), "confirmed");
-        if (!cancelled && !info && Date.now() - launch.createdAt > STALE_MINT_MS) {
-          abandonLaunch(launch.wallet, launch.mint, { reason: "mint_not_found_on_chain" });
-        }
-      } catch {
-        // Keep the lock when the chain can't be reached.
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [connection, launch?.mint, launch?.wallet]);
-
+  // NOTE: a pending launch is never released automatically (no age/timeout/"mint not found"
+  // rule). The global lifecycle lock (lib/lifecycleLock.js) only unlocks on on-chain proof.
   return launch;
 }

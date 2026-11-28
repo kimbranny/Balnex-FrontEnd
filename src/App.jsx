@@ -21,7 +21,10 @@ import { explorerAddress, explorerTx, friendlyError, saveLocalToken, shorten } f
 import { useWalletTokens } from "./lib/useWalletTokens";
 import Liquidity from "./pages/Liquidity";
 import LaunchCard from "./components/LaunchCard";
-import { getActiveLaunch, startLaunch, useActiveLaunch } from "./lib/launch";
+import { getAnyActiveLaunch, startLaunch, useActiveLaunch } from "./lib/launch";
+import LockBanner from "./components/LockBanner";
+import { acquireForCreation, adoptLegacyLaunch } from "./lib/lifecycleLock";
+import { useLifecycleLock, useVerifyLifecycle } from "./lib/useLifecycleLock";
 import { createMetadataInstruction } from "./lib/metadata";
 import { MAX_NAME_BYTES, MAX_SYMBOL_BYTES } from "./lib/metadataCodec";
 import Manage from "./pages/Manage";
@@ -94,8 +97,19 @@ export default function App() {
   // One unfinished launch per wallet (per network). See lib/launch.js.
   const walletAddress = publicKey ? publicKey.toBase58() : "";
   const launch = useActiveLaunch(walletAddress);
-  const creatingRef = useRef(false);
+  const { lock: lifecycleLock, corrupt: lockCorrupt } = useLifecycleLock();
+  const { verify: verifyLock } = useVerifyLifecycle();
+  const createLocked = !!lifecycleLock || lockCorrupt;
   const prevLaunch = useRef(null);
+
+  // Startup recovery: adopt an unfinished launch from an earlier BALNEX version into the global
+  // lock, then re-check the lock against the chain. If the chain can't be reached the lock stays.
+  useEffect(() => {
+    const legacy = getAnyActiveLaunch();
+    if (legacy) adoptLegacyLaunch(legacy);
+    verifyLock();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // When a launch ends (completed or abandoned), drop the old "token created" screen so
   // Create Token is available again.
@@ -232,23 +246,33 @@ export default function App() {
       return;
     }
 
-    // Launch lock, enforced here in application logic (not just by hiding the button).
-    // Read straight from storage so a stale render can't bypass it.
-    const pending = getActiveLaunch(publicKey.toBase58());
-    if (pending) {
-      notify("Finish or abandon your current launch before creating another token.", "error");
-      navigate("create");
+    // GLOBAL lifecycle lock, acquired synchronously (no await above this line) and read from
+    // storage, so a stale render or a double-click can't bypass it. It also holds the
+    // in-process operation guard until this handler finishes.
+    const acquired = acquireForCreation({
+      wallet: publicKey.toBase58(),
+      name: name.trim(),
+      symbol,
+      decimals: Number(decimals),
+      supply,
+    });
+    if (!acquired.ok) {
+      notify(acquired.message, "error");
+      if (acquired.code !== "OPERATION_IN_PROGRESS") navigate("create");
       return;
     }
-    if (creatingRef.current) return;
-    creatingRef.current = true;
+    const op = acquired.handle;
 
     setIsCreating(true);
     setCreateError("");
+    let sent = false;
+    let confirmed = false;
+    let sentSignature = null;
 
     try {
       // Generate a new mint account for this token.
       const mintKeypair = Keypair.generate();
+      op.setMint(mintKeypair.publicKey.toBase58()); // persisted before anything is signed
 
       // Convert the whole-number supply into the smallest token units.
       const tokenDecimals = Number(decimals);
@@ -379,13 +403,19 @@ export default function App() {
       transaction.partialSign(mintKeypair);
 
       // Ask Phantom to approve and sign the transaction.
+      op.signing(latestBlockhash.blockhash);
       const signedTransaction = await signTransaction(transaction);
 
-      // Submit the signed transaction to the configured Solana network.
+      // Mark the lifecycle "submitted" BEFORE the network can see the transaction, so a crash or
+      // refresh between send and confirm can never leave an unrecorded in-flight mint.
+      op.submitted({ blockhash: latestBlockhash.blockhash });
+      sent = true;
       const signature = await connection.sendRawTransaction(signedTransaction.serialize(), {
         skipPreflight: false,
         preflightCommitment: "confirmed",
       });
+      sentSignature = signature;
+      op.submitted({ signature, blockhash: latestBlockhash.blockhash });
 
       // Wait for blockchain confirmation.
       const confirmation = await connection.confirmTransaction(
@@ -428,7 +458,11 @@ export default function App() {
         createdAt: token.createdAt,
       });
 
-      // Confirmed on-chain: lock the wallet to this launch, then go straight to Create Pool.
+      // Confirmed on-chain: the lock records the mint and becomes this token's lifecycle.
+      op.confirmed({ mint: token.mint, signature, decimals: tokenDecimals, supply });
+      confirmed = true;
+
+      // Per-wallet launch record (used by the launch card and My Tokens).
       startLaunch({
         wallet: publicKey.toBase58(),
         mint: token.mint,
@@ -445,10 +479,20 @@ export default function App() {
     } catch (error) {
       console.error("Token creation error:", error);
       const message = friendlyError(error);
+      // Never clear the lock here. Before the send, nothing reached the network (safe retry);
+      // after it, the outcome is unknown until the chain has been checked.
+      if (!confirmed) op.failed({ submitted: sent ? true : false, signature: sentSignature, message, stage: sent ? "confirmation" : "signing" });
       setCreateError(message);
       notify(message, "error");
+      if (sent && !confirmed) {
+        const result = await verifyLock();
+        if (result?.status === "TOKEN_CREATED") {
+          notify("The token was created on-chain. Continue with its liquidity pool.", "success");
+          openLiquidity(result.lock.mint);
+        }
+      }
     } finally {
-      creatingRef.current = false;
+      op.end();
       setIsCreating(false);
     }
   }
@@ -503,6 +547,11 @@ export default function App() {
     setInspiration(null);
   }
 
+  function resumeLock(lock) {
+    if (lock.mint) openLiquidity(lock.mint);
+    else navigate("liquidity");
+  }
+
   function openLiquidity(mint) {
     setLiquidityMint(mint);
     navigate("liquidity");
@@ -551,6 +600,9 @@ export default function App() {
         </div>
       </header>
 
+      {/* GLOBAL LIFECYCLE LOCK BANNER (every page) */}
+      <LockBanner onResume={resumeLock} />
+
       {/* MENU */}
       {menuOpen && (
         <>
@@ -576,13 +628,22 @@ export default function App() {
 
       <main className="main">
         {/* CREATE TOKEN */}
-        {page === "create" && launch && (
+        {page === "create" && createLocked && (
           <section className="panel">
-            <LaunchCard launch={launch} onContinue={() => openLiquidity(launch.mint)} />
+            <span className="eyebrow">CREATE TOKEN</span>
+            <h2>Token creation is locked</h2>
+            <p className="muted">
+              BALNEX allows one token lifecycle at a time. You must complete or resolve the current token's liquidity
+              lifecycle, including a verified liquidity removal, before creating another token.
+            </p>
+            <button className="primary" type="button" disabled aria-disabled="true">
+              Create Token (locked)
+            </button>
+            {launch && lifecycleLock && <LaunchCard launch={launch} onContinue={() => openLiquidity(launch.mint)} />}
           </section>
         )}
 
-        {page === "create" && !launch && !createdToken && (
+        {page === "create" && !createLocked && !createdToken && (
           <>
             <section className="intro">
               <div className="status">
@@ -920,7 +981,7 @@ export default function App() {
         )}
 
         {/* CREATION SUCCESS */}
-        {page === "create" && !launch && createdToken && (
+        {page === "create" && !createLocked && createdToken && (
           <section className="panel">
             <div className="success-banner">
               <span>✓</span>
