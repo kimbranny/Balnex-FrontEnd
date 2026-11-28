@@ -578,7 +578,7 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
       if (lifecycleOp) {
         try {
           const details = err?.details || {};
-          lifecycleOp.update(details.submitted || submitted ? "unknown" : "failed_no_submission", {
+          lifecycleOp.update(details.landed === "failed" ? "failed_submitted" : details.submitted || submitted ? "unknown" : "failed_no_submission", {
             ...(details.signature || submitted ? { signature: details.signature || submitted } : {}),
             reason: err?.message || "Pool creation failed.",
           });
