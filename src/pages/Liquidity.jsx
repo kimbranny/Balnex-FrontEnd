@@ -788,6 +788,40 @@ export default function Liquidity({ walletTokens, initialMint, onNavigate }) {
             const status = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
             const account = lifecycleLock.poolId ? await connection.getAccountInfo(new PublicKey(lifecycleLock.poolId), "confirmed") : null;
             setLifecycleVerification({ signature, status: status.value[0] || null, poolAccountExists: Boolean(account), checked: true });
+            if (!status.value[0] && Number.isFinite(lifecycleLock.operation?.lastValidBlockHeight)) {
+              const height = await connection.getBlockHeight("confirmed");
+              if (height > lifecycleLock.operation.lastValidBlockHeight) {
+                if (lifecycleLock.operation?.type === "token_create") {
+                  const mintAccount = await connection.getAccountInfo(new PublicKey(lifecycleLock.mint), "confirmed");
+                  if (!mintAccount) {
+                    markOperationOutcome("failed_no_submission", { reason: "The signed transaction signature is absent from RPC, its blockhash expired, and the reserved mint account does not exist." });
+                    notify("The token transaction did not land. Safe retry is now available.", "success");
+                    return;
+                  }
+                }
+                if (lifecycleLock.operation?.type === "pool_create" && !account) {
+                  markOperationOutcome("failed_no_submission", { reason: "The signed pool transaction signature is absent from RPC, its blockhash expired, and the derived pool account does not exist." });
+                  notify("The pool transaction did not land. Safe retry is now available.", "success");
+                  return;
+                }
+                if (lifecycleLock.operation?.type === "remove_liquidity" && lifecycleLock.poolId && publicKey?.toBase58() === lifecycleLock.wallet) {
+                  const record = loadPoolRecords().find((item) => item.mint === lifecycleLock.mint && item.poolId === lifecycleLock.poolId);
+                  if (record) {
+                    const currentPosition = await verifyOne(record);
+                    const before = lifecycleLock.operation.lpBalanceBefore;
+                    const reservesBefore = lifecycleLock.operation.reservesBefore;
+                    if (currentPosition.status === "verified" && before !== undefined &&
+                        currentPosition.lpRaw.toString() === String(before) &&
+                        Number(currentPosition.reserves.token) === Number(reservesBefore?.token) &&
+                        Number(currentPosition.reserves.sol) === Number(reservesBefore?.sol)) {
+                      markOperationOutcome("failed_no_submission", { reason: "The signed removal signature is absent from RPC, its blockhash expired, and verified LP balance and pool reserves are unchanged." });
+                      notify("The removal transaction did not change on-chain state. Safe retry is now available.", "success");
+                      return;
+                    }
+                  }
+                }
+              }
+            }
             if (status.value[0]?.err) {
               if (lifecycleLock.operation?.type === "pool_create" && account) {
                 markOperationOutcome("unknown", { signature, reason: "Creation signature failed, but a pool account exists at the derived address. Verify its CPMM identity and reserves." });
