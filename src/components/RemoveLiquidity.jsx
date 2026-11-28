@@ -125,6 +125,10 @@ export default function RemoveLiquidity({
             lpDecimals: current.lpDecimals,
           },
         },
+        onSigned: (signedSignature) => lifecycleOp.update("signed", {
+          signature: signedSignature, poolId: active.prepared.poolId,
+          blockhash: active.blockhash, lastValidBlockHeight: active.lastValidBlockHeight,
+        }),
         onSubmitted: (signature) => {
           submittedSignature = signature;
           lifecycleOp.update("submitted", { signature, poolId: record.poolId });
